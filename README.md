@@ -185,6 +185,54 @@ You can look at the example functions provided in the library to see how to read
 
 [register-map]: https://assets.janitza.com/ce18jq9ih0x6/b83ae2356a42a682591109/ef2bc2b24a6b7c77de4dbda20e43cebf/janitza-mal-umg605pro-en.pdf
 
+## Record readings on the Pi
+
+`pq-meter-client` has a `record` subcommand that reads the L1 values from the meter on an
+interval and appends each one, with a timestamp, to a local SQLite file:
+
+```bash
+./pq-meter-client record --meter-ip 192.168.1.50 --db pqmeter.db --interval 1
+```
+
+```text
+recording 192.168.1.50:502 to pqmeter.db every 1.00s
+stored: 230.12 V, 1.83 A, 420.75 W, 12.50 var, 3.20 deg
+```
+
+A read that fails (a meter blip, a timeout) is logged and skipped; the loop keeps going.
+Stop it with Ctrl-C — every reading is already committed, so nothing is lost.
+
+### Read the readings back
+
+The same binary has a `show` subcommand, so you can look at the data over SSH without
+installing anything:
+
+```bash
+./pq-meter-client show --db pqmeter.db                 # the last 20, newest first
+./pq-meter-client show --db pqmeter.db --last 100
+./pq-meter-client show --db pqmeter.db --since-id 5000  # everything after row 5000
+./pq-meter-client show --db pqmeter.db --json           # one JSON object per line
+```
+
+```text
+      id  time (UTC)               V L1     A L1       W L1     var L1   deg L1
+       3  2026-09-10 15:53:02    230.12     1.83     420.75      12.50     3.20
+```
+
+`--since-id` is the cursor for an incremental consumer (a query endpoint the server polls):
+keep the largest `id` you have seen and pass it next time. That endpoint is not built yet.
+
+Reading with `show` while `record` is running is fine — the database is in WAL mode, so the
+reader and the writer do not block each other. If you prefer raw SQL and have `sqlite3`
+installed (`sudo apt install sqlite3`), the file is an ordinary SQLite database:
+
+```bash
+sqlite3 pqmeter.db "SELECT * FROM readings ORDER BY ts_millis DESC LIMIT 10"
+scp <user>@<hostname>.local:pqmeter.db .   # or copy it to the laptop
+```
+
+Running the client with no subcommand still sends one message over SCION as before.
+
 ## Installing the build tools
 
 You need Rust, cmake and a C/C++ compiler. The last two are needed because the TLS library
