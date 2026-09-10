@@ -120,4 +120,16 @@ impl Umg605ProClient {
     pub async fn power_l1_n(&mut self) -> Result<f32, ReadError> {
         self.read_f32(19020).await
     }
+
+    /// Fetches the reactive power of phase L1 in vars.
+    pub async fn reactive_power_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(19036).await
+    }
+
+    /// Fetches the phase angle between voltage and current of phase L1 in degrees.
+    ///
+    /// The UMG 605-PRO does not expose a mean-value register for phase angle.
+    pub async fn phase_angle_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(3971).await
+    }
 }
