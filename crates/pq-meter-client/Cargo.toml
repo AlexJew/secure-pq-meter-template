@@ -8,17 +8,20 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+http = { workspace = true }
 rusqlite = { workspace = true }
-scion-http3 = { workspace = true }
+scion-quic = { workspace = true }
 scion-sdk-utils = { workspace = true }
+scion-stack = { workspace = true }
 sciparse = { workspace = true }
 serde_json = { workspace = true }
 snap-tokens = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["io-util", "time"] }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-umg605-modbus-client = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

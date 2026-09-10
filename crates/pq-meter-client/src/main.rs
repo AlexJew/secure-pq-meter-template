@@ -1,55 +1,61 @@
-//! Client side of the Energy Data Hackdays gateway challenge. Runs on the gateway (the
-//! Raspberry Pi); `pq-meter-server` runs on the laptop.
+//! Client side of the PQ Meter CONNECT protocol.
 //!
-//! Two things it can do:
+//! With no subcommand, opens a persistent HTTP/3 `CONNECT` tunnel to
+//! `pq-meter-server` and answers its `"data"` requests with newline-delimited
+//! JSON (NDJSON), reconnecting with bounded backoff whenever the tunnel
+//! closes. See `CONNECT_PROTOCOL.md` at the repository root for the wire
+//! protocol this implements.
 //!
-//! * with no subcommand, it sends one message to `pq-meter-server` over SCION and prints
-//!   the answer. The work is done by [`scion_http3::Client`], the high-level HTTP/3 client
-//!   of the SDK, which keeps a pool of connections so a program that sends in a loop pays
-//!   for the connection only once. It needs two addresses:
-//!   * `--endhost-api`: the URL of the endhost API of its own AS, where the client asks for
-//!     paths and for the SNAP that carries its packets. The server prints this URL.
-//!   * `--server`: the SCION address of the HTTP/3 server, also printed by the server.
-//! * `record` reads the meter over Modbus TCP on an interval and appends each reading to a
-//!   local SQLite file (see [`storage`]). This is what runs on the Pi to build up history.
-//! * `show` prints readings back from that file — the newest few, or everything after a
-//!   given row id — as a table or as JSON lines.
+//! Every reading answered over the tunnel is also appended to a local SQLite
+//! file (see [`storage`]), so history survives a restart and can be inspected
+//! without the server. `show` prints that history back — the newest few, or
+//! everything after a given row id — as a table or as JSON lines.
+//!
+//! The meter itself is read through the [`meter::MeterSource`] trait; `main`
+//! wires in [`meter::DummyMeter`] today. See `scripts/run-dummy.sh` to run this
+//! against dummy data.
 
-// `record`/`show` use most of `storage`; `query` (time-range reads) is exercised only by
-// the storage tests and waits for the query endpoint.
+mod meter;
+// `show` uses most of `storage`; `query` (time-range reads) is exercised only
+// by the storage tests and waits for a query endpoint on the server.
 #[allow(dead_code)]
 mod storage;
 
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::Parser;
-use scion_http3::{Client, Config, Request, scion_quic::quic::config::QuicConfig};
+use meter::MeterSource;
+use scion_quic::{
+    h3::client::{H3DuplexStream, Http3Client},
+    quic::config::QuicConfig,
+    socket::GenericScionUdpSocket,
+};
+use scion_stack::ScionStackBuilder;
 use sciparse::address::ip_socket_addr::ScionSocketIpAddr;
-use umg605_modbus_client::{DEFAULT_MODBUS_PORT, ModbusUnit, ReadError, Umg605ProClient};
+use serde_json::{Value, json};
+use storage::{MeterStore, StoredReading};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
-
-use storage::{MeterStore, Reading, StoredReading};
 
 /// TLS name the server's certificate is issued for.
 const SERVER_NAME: &str = "pq-meter-server";
 
-/// Largest response body we read. The answer of the server is a few bytes.
-const MAX_BODY_SIZE: usize = 1024;
+/// Largest NDJSON line accepted from the server before the tunnel is closed.
+const MAX_LINE_SIZE: usize = 64 * 1024;
 
-/// Unit id for a directly addressed Modbus TCP device, per the Modbus TCP spec.
-const DEFAULT_MODBUS_UNIT: u8 = 1;
+/// Backoff applied between reconnect attempts, doubling up to the maximum.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-// Command line arguments. With no subcommand the client runs `SendArgs` (the original
-// behaviour), so the invocations in the README keep working; `record` takes over
-// completely and does not need the SCION addresses. The doc comment is deliberately a
-// plain comment so clap shows only the `about` string below, not this note.
+// With no subcommand the client runs `TunnelArgs` (opening the CONNECT
+// tunnel); `show` reads the SQLite file instead and does not need the SCION
+// addresses. The doc comment is deliberately a plain comment so clap shows
+// only the `about` string below, not this note.
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Sends meter data to pq-meter-server over SCION, or records it locally",
+    about = "Maintains a CONNECT tunnel to pq-meter-server and answers its data requests, or shows stored readings",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
@@ -58,21 +64,18 @@ struct Args {
     command: Option<Command>,
 
     #[command(flatten)]
-    send: Option<SendArgs>,
+    tunnel: Option<TunnelArgs>,
 }
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Read the meter on an interval and append each reading to a local SQLite file.
-    Record(RecordArgs),
-
-    /// Print stored readings from the SQLite file.
+    /// Print stored readings from the local SQLite file.
     Show(ShowArgs),
 }
 
-/// Arguments for the default "send one message over SCION" behaviour.
+/// Arguments for the default behaviour: opening the CONNECT tunnel.
 #[derive(Debug, clap::Args)]
-struct SendArgs {
+struct TunnelArgs {
     /// URL of the endhost API this client attaches to, for example
     /// `http://192.168.1.42:31000`.
     #[arg(long)]
@@ -82,41 +85,10 @@ struct SendArgs {
     #[arg(long)]
     server: ScionSocketIpAddr,
 
-    /// Path to POST to on the server.
-    #[arg(long, default_value = "/edh/v1/hello")]
-    path: String,
-
-    /// Message to send.
-    #[arg(long, default_value = "Hello from Energy Data Hackdays 2026")]
-    message: String,
-}
-
-/// Arguments for `record`.
-#[derive(Debug, clap::Args)]
-struct RecordArgs {
-    /// IP address of the UMG 605-PRO meter.
-    #[arg(long)]
-    meter_ip: IpAddr,
-
-    /// Modbus TCP port of the meter.
-    #[arg(long, default_value_t = DEFAULT_MODBUS_PORT)]
-    meter_port: u16,
-
-    /// Modbus unit id configured on the meter.
-    #[arg(long, default_value_t = DEFAULT_MODBUS_UNIT)]
-    meter_unit: u8,
-
-    /// SQLite file to append readings to. Created if it does not exist.
+    /// SQLite file every answered reading is also appended to. Created if it
+    /// does not exist.
     #[arg(long, default_value = "pqmeter.db")]
     db: PathBuf,
-
-    /// Seconds between readings.
-    #[arg(long, default_value_t = 1.0)]
-    interval: f64,
-
-    /// Timeout in seconds for connecting and for each register read.
-    #[arg(long, default_value_t = 5)]
-    timeout: u64,
 }
 
 /// Arguments for `show`.
@@ -143,6 +115,16 @@ struct ShowArgs {
     json: bool,
 }
 
+/// The gateway's persistent state: the meter it reads, the local database
+/// every reading is appended to, and the running index it stamps replies
+/// with. Outlives any single tunnel, so a reconnect picks up where the last
+/// one left off.
+struct Gateway {
+    meter: Box<dyn MeterSource>,
+    store: MeterStore,
+    next_index: u64,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -153,128 +135,213 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    match (args.command, args.send) {
-        (Some(Command::Record(record_args)), _) => record(record_args).await,
+    match (args.command, args.tunnel) {
         (Some(Command::Show(show_args)), _) => show(show_args),
-        (None, Some(send_args)) => send(send_args).await,
+        (None, Some(tunnel_args)) => run(tunnel_args).await,
         (None, None) => Err(anyhow::anyhow!(
-            "nothing to do: run `record` or `show`, or pass --endhost-api and --server to send. See --help."
+            "nothing to do: pass --endhost-api and --server to open the tunnel, or run `show`. See --help."
         )),
     }
 }
 
-/// Sends one message to the server over SCION and prints the answer.
-async fn send(args: SendArgs) -> anyhow::Result<()> {
+/// Opens the CONNECT tunnel and serves data requests on it, reconnecting with
+/// backoff until the process is stopped.
+async fn run(args: TunnelArgs) -> anyhow::Result<()> {
     // The SDK uses rustls for its control plane; pick a crypto backend.
     scion_sdk_utils::rustls::select_ring_crypto_provider();
 
-    // One client per program: it holds the connection pool. Building it does no I/O, the
-    // connection is established with the first request.
-    let client = Client::new(
-        Config::new(args.endhost_api)
-            // A dummy token. Normally a client asks the AA (the authentication and
-            // authorization service) for a SNAP token; here the AA is left out.
-            .with_auth_token(snap_tokens::v0::dummy_snap_token())
-            // The server uses a self-signed certificate, so its identity is not verified.
-            .with_quic_config(QuicConfig::builder().verify_peer(false).build()),
-    );
-
-    let body = serde_json::to_vec(&serde_json::json!({ "message": args.message }))
-        .context("encoding the message")?;
-
-    // The URL holds the server name and the port. `target` gives the SCION address the
-    // packets go to, so the simulated network needs no DNS.
-    let url = format!("https://{SERVER_NAME}:{}{}", args.server.port(), args.path);
-    let request = Request::post(&url)
-        .header("content-type", "application/json")
-        .target(args.server.host())
-        .body(body)
-        .build()
-        .context("building the request")?;
-
-    println!("sending to {}{} ...", args.server, args.path);
-
-    let response = client
-        .request(request)
+    let socket = build_socket(&args.endhost_api)
         .await
-        .context("sending the request")?;
-    let status = response.status();
-    let (body, _trailers) = response
-        .text(Some(MAX_BODY_SIZE))
-        .await
-        .context("reading the response")?;
+        .context("setting up the SCION stack")?;
 
-    println!("server answered {status}: {body}");
-
-    client.close().await;
-
-    anyhow::ensure!(status.is_success(), "server answered with {status}");
-    Ok(())
-}
-
-/// Reads the meter every `interval` seconds and appends each reading to the database.
-///
-/// A read that fails (a meter blip, a timeout) is logged and skipped; the loop keeps
-/// going. Only a failure to connect at startup, or to open the database, stops it.
-async fn record(args: RecordArgs) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.interval.is_finite() && args.interval > 0.0,
-        "interval must be a positive number of seconds, got {}",
-        args.interval
+    // The server uses a self-signed certificate, so its identity is not verified.
+    let client = Http3Client::with_config(
+        args.server,
+        socket,
+        Some(SERVER_NAME.to_string()),
+        QuicConfig::builder().verify_peer(false).build(),
     );
-    let period = Duration::from_secs_f64(args.interval);
-    let timeout = Duration::from_secs(args.timeout);
-    let meter_addr = SocketAddr::new(args.meter_ip, args.meter_port);
+    let authority = format!("{SERVER_NAME}:{}", args.server.port());
 
     let store = MeterStore::open(&args.db)
         .with_context(|| format!("opening the database at {}", args.db.display()))?;
-    let mut client =
-        Umg605ProClient::connect_tcp(meter_addr, ModbusUnit(args.meter_unit), timeout)
-            .await
-            .with_context(|| format!("connecting to the meter at {meter_addr}"))?;
+    let mut gateway = Gateway {
+        meter: Box::new(meter::DummyMeter::new()),
+        store,
+        next_index: 1,
+    };
 
-    println!(
-        "recording {meter_addr} to {} every {:.2?}",
-        args.db.display(),
-        period
-    );
-
-    let mut ticker = tokio::time::interval(period);
+    let mut backoff = INITIAL_BACKOFF;
     loop {
-        ticker.tick().await;
-        match read_l1(&mut client).await {
-            Ok(reading) => match store.insert_now(reading) {
-                Ok(()) => println!(
-                    "stored: {:.2} V, {:.2} A, {:.2} W, {:.2} var, {:.2} deg",
-                    reading.voltage_l1,
-                    reading.current_l1,
-                    reading.real_power_l1,
-                    reading.reactive_power_l1,
-                    reading.phase_angle_l1
-                ),
-                Err(e) => eprintln!("warning: could not store reading: {e:#}"),
-            },
-            Err(e) => eprintln!("warning: could not read the meter: {e}"),
+        tracing::info!(server = %args.server, "opening tunnel");
+        match run_tunnel(&client, &authority, &mut gateway).await {
+            Ok(()) => {
+                tracing::info!("tunnel closed, reconnecting");
+                backoff = INITIAL_BACKOFF;
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, delay = ?backoff, "tunnel failed, reconnecting");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
         }
     }
 }
 
-/// Reads the five L1 measured values and assembles a [`Reading`].
-///
-/// `ts_millis` is left at zero; [`MeterStore::insert_now`] stamps it.
-async fn read_l1(client: &mut Umg605ProClient) -> Result<Reading, ReadError> {
-    Ok(Reading {
-        ts_millis: 0,
-        voltage_l1: client.voltage_l1().await? as f64,
-        current_l1: client.current_l1().await? as f64,
-        real_power_l1: client.power_l1_n().await? as f64,
-        reactive_power_l1: client.reactive_power_l1().await? as f64,
-        phase_angle_l1: client.phase_angle_l1().await? as f64,
-    })
+/// Builds the SCION socket the client sends and receives packets on.
+async fn build_socket(endhost_api: &Url) -> anyhow::Result<Arc<dyn GenericScionUdpSocket>> {
+    let stack = ScionStackBuilder::new()
+        .with_endhost_api(endhost_api.clone())
+        // A dummy token. Normally a client asks the AA (the authentication and
+        // authorization service) for a SNAP token; here the AA is left out.
+        .with_auth_token(snap_tokens::v0::dummy_snap_token())
+        .build()
+        .await
+        .context("building the SCION stack")?;
+    let socket = stack.bind(None).await.context("opening a SCION socket")?;
+    Ok(Arc::new(socket))
 }
 
-/// Prints stored readings: `--since-id` for everything after a row id (oldest first),
-/// otherwise the most recent `--last` (newest first).
+/// Opens one `CONNECT` tunnel and hands the resulting byte stream to
+/// [`serve_tunnel`].
+async fn run_tunnel(
+    client: &Http3Client,
+    authority: &str,
+    gateway: &mut Gateway,
+) -> anyhow::Result<()> {
+    let request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("https://{authority}"))
+        .body(())
+        .context("building the CONNECT request")?;
+
+    let (response, writer) = client
+        .request_with_writer(request)
+        .await
+        .context("sending the CONNECT request")?;
+    let response = response.await.context("awaiting the CONNECT response")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "server refused the tunnel with {}",
+        response.status()
+    );
+
+    let stream = H3DuplexStream::new(writer, response.into_body());
+    serve_tunnel(stream, gateway).await
+}
+
+/// Frames NDJSON off `stream` and answers each message, until the peer closes
+/// its write half or a framing error closes the tunnel. Generic over the byte
+/// stream so it can be driven over an in-memory pipe in tests, with no network.
+async fn serve_tunnel<S>(mut stream: S, gateway: &mut Gateway) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .context("reading from the tunnel")?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = buf[..pos].to_vec();
+            buf.drain(..=pos);
+            handle_line(&mut stream, &line, gateway).await?;
+        }
+
+        anyhow::ensure!(
+            buf.len() <= MAX_LINE_SIZE,
+            "line exceeds {MAX_LINE_SIZE} bytes without a delimiter"
+        );
+    }
+}
+
+/// Parses one NDJSON line, answers it, and writes the reply to `stream`.
+async fn handle_line<S>(stream: &mut S, line: &[u8], gateway: &mut Gateway) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let request: Value = match serde_json::from_slice(line) {
+        Ok(value) => value,
+        Err(err) => bail!("invalid JSON line: {err}"),
+    };
+
+    let Some(id) = request.get("id").and_then(Value::as_u64) else {
+        bail!("message is missing a numeric \"id\"");
+    };
+    let kind = request
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let reply = match kind {
+        "data" => {
+            let from_index = request
+                .pointer("/payload/index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            tracing::debug!(id, from_index, "answering data request");
+            match gateway.meter.read_snapshot().await {
+                Ok(snapshot) => {
+                    // Local persistence is a side channel: a failure to store the
+                    // reading is logged, not surfaced as a protocol error, so the
+                    // server still gets its reply either way.
+                    if let Err(err) = gateway.store.insert_now(snapshot.into()) {
+                        tracing::warn!(id, error = ?err, "failed to persist reading");
+                    }
+
+                    let index = gateway.next_index;
+                    gateway.next_index += 1;
+                    json!({
+                        "type": "data",
+                        "id": id,
+                        "payload": { "data": [snapshot.to_json(index)] },
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(id, error = ?err, "meter read failed");
+                    json!({
+                        "type": "error",
+                        "id": id,
+                        "payload": { "message": format!("unable to read the meter: {err:#}") },
+                    })
+                }
+            }
+        }
+        other => {
+            tracing::warn!(id, kind = other, "unsupported message type");
+            json!({
+                "type": "error",
+                "id": id,
+                "payload": { "message": format!("unsupported message type \"{other}\"") },
+            })
+        }
+    };
+
+    write_line(stream, &reply).await
+}
+
+/// Writes one NDJSON message, terminated by `\n`, and flushes it.
+async fn write_line<S>(stream: &mut S, message: &Value) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut bytes = serde_json::to_vec(message).context("encoding reply")?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await.context("writing reply")?;
+    stream.flush().await.context("flushing reply")?;
+    Ok(())
+}
+
+/// Prints stored readings: `--since-id` for everything after a row id (oldest
+/// first), otherwise the most recent `--last` (newest first).
 fn show(args: ShowArgs) -> anyhow::Result<()> {
     let store = MeterStore::open(&args.db)
         .with_context(|| format!("opening the database at {}", args.db.display()))?;
@@ -299,14 +366,14 @@ fn select_rows(store: &MeterStore, args: &ShowArgs) -> anyhow::Result<Vec<Stored
 }
 
 fn row_json(row: &StoredReading) -> String {
-    serde_json::json!({
+    json!({
         "id": row.id,
         "ts_millis": row.reading.ts_millis,
-        "voltage_l1": row.reading.voltage_l1,
-        "current_l1": row.reading.current_l1,
-        "real_power_l1": row.reading.real_power_l1,
-        "reactive_power_l1": row.reading.reactive_power_l1,
-        "phase_angle_l1": row.reading.phase_angle_l1,
+        "voltage_l1_v": row.reading.voltage_l1,
+        "current_l1_a": row.reading.current_l1,
+        "active_power_l1_w": row.reading.real_power_l1,
+        "reactive_power_l1_var": row.reading.reactive_power_l1,
+        "phase_angle_l1_deg": row.reading.phase_angle_l1,
     })
     .to_string()
 }
@@ -334,12 +401,186 @@ fn print_table(rows: &[StoredReading]) {
     }
 }
 
+/// Bridges the meter's own reading type to the one `storage` persists.
+/// `ts_millis` is left at zero; [`MeterStore::insert_now`] stamps it.
+impl From<meter::MeterSnapshot> for storage::Reading {
+    fn from(snapshot: meter::MeterSnapshot) -> Self {
+        storage::Reading {
+            ts_millis: 0,
+            voltage_l1: snapshot.voltage_l1_v,
+            current_l1: snapshot.current_l1_a,
+            real_power_l1: snapshot.active_power_l1_w,
+            reactive_power_l1: snapshot.reactive_power_l1_var,
+            phase_angle_l1: snapshot.phase_angle_l1_deg,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
+    use crate::meter::MeterSnapshot;
+
+    fn test_gateway() -> Gateway {
+        Gateway {
+            meter: Box::new(meter::DummyMeter::new()),
+            store: MeterStore::open(std::path::Path::new(":memory:")).expect("in-memory store"),
+            next_index: 1,
+        }
+    }
+
+    /// Encodes `requests` as NDJSON, one per line.
+    fn ndjson(requests: &[Value]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for request in requests {
+            bytes.extend(serde_json::to_vec(request).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    /// Writes `input` into one half of an in-memory pipe and shuts that half
+    /// down, so `serve_tunnel` sees EOF once it has drained everything
+    /// already written, then runs the loop to completion and returns its
+    /// result plus everything it wrote back.
+    ///
+    /// The pipe is sized well above `MAX_LINE_SIZE` so a test writing an
+    /// oversized line cannot deadlock against a buffer nobody has started
+    /// draining yet (everything is written before `serve_tunnel` is polled).
+    async fn serve_input(gateway: &mut Gateway, input: &[u8]) -> (anyhow::Result<()>, String) {
+        let (mut peer, tunnel) = tokio::io::duplex(4 * MAX_LINE_SIZE);
+        peer.write_all(input).await.unwrap();
+        peer.shutdown().await.unwrap();
+
+        let result = serve_tunnel(tunnel, gateway).await;
+
+        let mut replies = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut peer, &mut replies)
+            .await
+            .unwrap();
+        (result, replies)
+    }
+
+    fn parse_replies(replies: &str) -> Vec<Value> {
+        replies
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn data_request_is_answered_with_a_snapshot() {
+        let mut gateway = test_gateway();
+        let input = ndjson(&[json!({"type": "data", "id": 42, "payload": {}})]);
+        let (result, replies) = serve_input(&mut gateway, &input).await;
+        result.expect("serve_tunnel should exit cleanly on EOF");
+        println!("dummy data reply: {}", replies.trim_end());
+
+        let reply = &parse_replies(&replies)[0];
+        assert_eq!(reply["type"], "data");
+        assert_eq!(reply["id"], 42);
+        let data = reply["payload"]["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1);
+        assert!(data[0]["voltage_l1_v"].is_number());
+        assert_eq!(data[0]["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn data_request_is_also_persisted_to_the_store() {
+        let mut gateway = test_gateway();
+        let input = ndjson(&[json!({"type": "data", "id": 1, "payload": {}})]);
+        serve_input(&mut gateway, &input).await.0.unwrap();
+
+        let stored = gateway.store.latest(10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].reading.voltage_l1 > 0.0);
+    }
+
+    #[tokio::test]
+    async fn index_increases_across_requests() {
+        let mut gateway = test_gateway();
+        let input = ndjson(&[
+            json!({"type": "data", "id": 1, "payload": {}}),
+            json!({"type": "data", "id": 2, "payload": {}}),
+        ]);
+        let (result, replies) = serve_input(&mut gateway, &input).await;
+        result.expect("serve_tunnel should exit cleanly on EOF");
+
+        let lines = parse_replies(&replies);
+        assert_eq!(lines[0]["payload"]["data"][0]["index"], 1);
+        assert_eq!(lines[1]["payload"]["data"][0]["index"], 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_type_is_answered_with_an_error() {
+        let mut gateway = test_gateway();
+        let input = ndjson(&[
+            json!({"type": "reboot", "id": 7, "payload": {}}),
+            json!({"type": "data", "id": 8, "payload": {}}),
+        ]);
+        let (result, replies) = serve_input(&mut gateway, &input).await;
+        result.expect("an unknown type should not close the tunnel");
+
+        let lines = parse_replies(&replies);
+        assert_eq!(lines[0]["type"], "error");
+        assert_eq!(lines[0]["id"], 7);
+        assert!(lines[0]["payload"]["message"].is_string());
+        // The tunnel stays open after an unknown type: the next request is
+        // still answered.
+        assert_eq!(lines[1]["type"], "data");
+    }
+
+    /// A meter that always fails, to prove a read failure reaches the wire as
+    /// the protocol's `"error"` reply instead of the tunnel just dying.
+    struct BrokenMeter;
+
+    #[async_trait::async_trait]
+    impl MeterSource for BrokenMeter {
+        async fn read_snapshot(&mut self) -> anyhow::Result<MeterSnapshot> {
+            anyhow::bail!("meter did not respond")
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_failure_is_answered_with_an_error() {
+        let mut gateway = Gateway {
+            meter: Box::new(BrokenMeter),
+            store: MeterStore::open(std::path::Path::new(":memory:")).expect("in-memory store"),
+            next_index: 1,
+        };
+        let input = ndjson(&[json!({"type": "data", "id": 1, "payload": {}})]);
+        let (result, replies) = serve_input(&mut gateway, &input).await;
+        result.expect("a meter failure should not close the tunnel");
+
+        let reply = &parse_replies(&replies)[0];
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["id"], 1);
+        let message = reply["payload"]["message"]
+            .as_str()
+            .expect("message string");
+        assert!(message.contains("meter did not respond"));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_closes_the_tunnel() {
+        let mut gateway = test_gateway();
+        let (result, _) = serve_input(&mut gateway, b"not json\n").await;
+        assert!(result.is_err(), "invalid JSON should close the tunnel");
+    }
+
+    #[tokio::test]
+    async fn oversized_line_closes_the_tunnel() {
+        let mut gateway = test_gateway();
+        // No delimiter, so the whole thing accumulates as one unterminated line.
+        let oversized = vec![b'a'; MAX_LINE_SIZE + 1];
+        let (result, _) = serve_input(&mut gateway, &oversized).await;
+        assert!(result.is_err(), "an oversized line should close the tunnel");
+    }
 
     #[test]
-    fn bare_invocation_is_the_send_command() {
+    fn bare_invocation_is_the_tunnel_command() {
         let args = Args::try_parse_from([
             "pq-meter-client",
             "--endhost-api",
@@ -350,45 +591,24 @@ mod tests {
         .unwrap();
 
         assert!(args.command.is_none());
-        let send = args.send.expect("send args parsed");
-        assert_eq!(send.message, "Hello from Energy Data Hackdays 2026");
-        assert_eq!(send.path, "/edh/v1/hello");
+        let tunnel = args.tunnel.expect("tunnel args parsed");
+        assert_eq!(tunnel.db, PathBuf::from("pqmeter.db"));
     }
 
     #[test]
-    fn record_needs_only_the_meter_ip() {
-        let args =
-            Args::try_parse_from(["pq-meter-client", "record", "--meter-ip", "192.168.1.50"])
-                .unwrap();
-
-        let Some(Command::Record(rec)) = args.command else {
-            panic!("expected the record command, got {:?}", args.command);
-        };
-        assert_eq!(rec.meter_ip.to_string(), "192.168.1.50");
-        assert_eq!(rec.meter_port, DEFAULT_MODBUS_PORT);
-        assert_eq!(rec.db, PathBuf::from("pqmeter.db"));
-        assert_eq!(rec.interval, 1.0);
+    fn show_does_not_require_the_scion_addresses() {
+        assert!(Args::try_parse_from(["pq-meter-client", "show"]).is_ok());
     }
 
     #[test]
-    fn record_does_not_require_the_scion_addresses() {
-        // subcommand_negates_reqs: `record` parses without --endhost-api / --server.
-        assert!(
-            Args::try_parse_from(["pq-meter-client", "record", "--meter-ip", "10.0.0.1"]).is_ok()
-        );
-    }
-
-    #[test]
-    fn record_rejects_mixing_in_the_send_flags() {
+    fn show_rejects_mixing_in_the_tunnel_flags() {
         // args_conflicts_with_subcommands: can't do both at once.
         assert!(
             Args::try_parse_from([
                 "pq-meter-client",
                 "--server",
                 "[2-ff00:0:212,127.0.0.1]:1",
-                "record",
-                "--meter-ip",
-                "10.0.0.1",
+                "show",
             ])
             .is_err()
         );
@@ -410,15 +630,8 @@ mod tests {
     #[test]
     fn show_rejects_last_together_with_since_id() {
         assert!(
-            Args::try_parse_from([
-                "pq-meter-client",
-                "show",
-                "--last",
-                "5",
-                "--since-id",
-                "10"
-            ])
-            .is_err()
+            Args::try_parse_from(["pq-meter-client", "show", "--last", "5", "--since-id", "10"])
+                .is_err()
         );
     }
 
@@ -472,8 +685,8 @@ mod tests {
         assert_eq!(ids, vec![5, 4]);
     }
 
-    fn sample() -> Reading {
-        Reading {
+    fn sample() -> storage::Reading {
+        storage::Reading {
             ts_millis: 0,
             voltage_l1: 230.0,
             current_l1: 1.8,

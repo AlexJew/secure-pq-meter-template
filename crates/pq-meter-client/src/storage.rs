@@ -274,7 +274,12 @@ mod tests {
             store.insert(&sample(ts)).unwrap();
         }
 
-        let ids: Vec<i64> = store.query(0, 1_000).unwrap().iter().map(|r| r.id).collect();
+        let ids: Vec<i64> = store
+            .query(0, 1_000)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
         assert_eq!(ids, vec![1, 2, 3]);
     }
 

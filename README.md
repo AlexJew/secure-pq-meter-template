@@ -24,12 +24,14 @@ crates/
     src/network.rs         The simulated SCION network (which ASes, which addresses)
     src/api.rs             The HTTP/3 endpoint that receives the data
   pq-meter-client/         Runs on the gateway
-    src/main.rs            Sends one message and prints the answer
+    src/main.rs            Maintains the CONNECT tunnel, answers "data" requests
+    src/meter.rs           The MeterSource trait and the dummy meter that implements it
   umg605-modbus-client/    Reads data from a UMG 605-PRO power quality meter over Modbus TCP
     src/lib.rs             The Modbus TCP client and the registers it reads
     bin/pinger.rs          Example binary that reads values from the meter
 Cargo.toml                 Workspace, pins the SCION SDK version
 rust-toolchain.toml        Rust version used to build this repository
+scripts/run-dummy.sh       Runs the client against its dummy meter, see below
 ```
 
 The server and client are built on the [SCION endhost SDK](https://github.com/Anapaya/scion-sdk),
@@ -98,17 +100,32 @@ cargo run -p pq-meter-client -- \
   --server '[2-ff00:0:212,127.0.0.1]:59218'
 ```
 
-The client prints `server answered 200 OK: ok`, and the server prints what it received:
-
-```text
-received: {"message":"Hello from Energy Data Hackdays 2026"}
-```
-
-The server keeps running; the client sends one message and exits. Use `--message` to send
-something else.
+The client maintains a `CONNECT` tunnel to the server and answers its `"data"` requests; see
+`CONNECT_PROTOCOL.md` for the wire protocol. The server in this template does not yet speak
+that protocol (it still only serves the original one-shot `POST /edh/v1/hello` used above), so
+until that lands the client logs a `404 Not Found` and retries with backoff — see
+[Run against dummy meter data](#run-against-dummy-meter-data) for a way to exercise the
+client's side of the protocol without it.
 
 Note that the port of the server address (`59218` above) is assigned by the SNAP and is
 different on every start, so take the address from the output rather than from this README.
+
+## Run against dummy meter data
+
+`pq-meter-client` reads the meter through the `meter::MeterSource` trait
+(`crates/pq-meter-client/src/meter.rs`); today `main` wires in a `DummyMeter` that produces
+plausible, slowly drifting readings with no hardware attached. `scripts/run-dummy.sh` exercises
+this:
+
+```bash
+scripts/run-dummy.sh          # hermetic: builds, then runs the client's tests, printing
+                               # a real dummy "data" reply. No server or network needed.
+scripts/run-dummy.sh --live   # starts pq-meter-server, scrapes its address, and points
+                               # the client at it (see the CONNECT note above).
+```
+
+See `METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`, and the script fit
+together, and how to plug in the real Modbus-backed meter later.
 
 ## Run it between the Pi and the laptop
 
@@ -125,8 +142,7 @@ The printed URLs and addresses now use that IP address. Run the client on the Pi
 ```bash
 ./pq-meter-client \
   --endhost-api http://192.168.1.42:31000/ \
-  --server '[2-ff00:0:212,192.168.1.42]:59218' \
-  --message '{"my":"first measurement"}'
+  --server '[2-ff00:0:212,192.168.1.42]:59218'
 ```
 
 The server binds these ports on the address you pass, and all of them have to be reachable
@@ -332,13 +348,16 @@ cargo cross build --release -p umg605-modbus-client --bin pinger --target aarch6
 
 ## Where to continue
 
-* **Read the meter.** `pq-meter-client` already depends on `umg605-modbus-client`, so
-  `use umg605_modbus_client::Umg605ProClient;` in `crates/pq-meter-client/src/main.rs` is
-  enough to read a value and send it on. Check the meter with the `pinger` [first](#read-from-the-meter).
-* **Send your own data.** The client sends a JSON object with one field. Build whatever
-  structure your measurements need in `crates/pq-meter-client/src/main.rs`, and send in a
-  loop instead of once. Keep the one `scion_http3::Client`: it holds a pool of connections,
-  so every request after the first one reuses the connection that is already up.
+* **Read the meter.** `pq-meter-client` reads through the `meter::MeterSource` trait
+  (`crates/pq-meter-client/src/meter.rs`), currently wired to a `DummyMeter`. Add
+  `umg605-modbus-client` as a dependency of `pq-meter-client` and implement `MeterSource` for a
+  type that holds a connected `Umg605ProClient`, reading `voltage_l1`, `current_l1`,
+  `power_l1_n`, `reactive_power_l1` and `phase_angle_l1` into a `MeterSnapshot`. Check the meter
+  with the `pinger` [first](#read-from-the-meter).
+* **Send your own data.** `MeterSnapshot::to_json` in `meter.rs` is where the wire fields for a
+  `"data"` reply are built; change it to send whatever structure your measurements need. Keep
+  the one `Http3Client` and its `CONNECT` tunnel: it stays open for the life of the process, so
+  every reply after the first reuses the connection that is already up.
 * **Receive your own data.** The server prints the request body as text
   (`crates/pq-meter-server/src/api.rs`). It is a normal [axum](https://docs.rs/axum)
   application, so you can add routes, and let axum parse your JSON into a type by taking
