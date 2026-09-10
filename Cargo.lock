@@ -3075,13 +3075,9 @@ name = "pq-meter-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
- "chrono",
  "clap",
- "http",
- "scion-quic",
+ "scion-http3",
  "scion-sdk-utils",
- "scion-stack",
  "sciparse",
  "serde_json",
  "snap-tokens",
@@ -3863,6 +3859,26 @@ dependencies = [
  "scion-quic",
  "tokio-util",
  "tower",
+]
+
+[[package]]
+name = "scion-http3"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "501fe58f8657ea503bd592dcdef9090a782dfb1d80e1e5ca61d95305880ea86a"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "scion-quic",
+ "scion-stack",
+ "sciparse",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
