@@ -73,6 +73,8 @@ struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
+    /// Poll the Modbus meter and append readings to the local SQLite file.
+    Record(RecordArgs),
     /// Print stored readings from the local SQLite file.
     Show(ShowArgs),
 }
@@ -109,6 +111,45 @@ struct TunnelArgs {
     /// does not exist.
     #[arg(long, default_value = "pqmeter.db")]
     db: PathBuf,
+}
+
+/// Arguments for recording meter readings without a SCION connection.
+#[derive(Debug, clap::Args)]
+struct RecordArgs {
+    /// IP address of the UMG 605-PRO Modbus TCP meter.
+    #[arg(long)]
+    meter_ip: IpAddr,
+
+    /// Modbus TCP port of the meter.
+    #[arg(long, default_value_t = umg605_modbus_client::DEFAULT_MODBUS_PORT)]
+    meter_port: u16,
+
+    /// Modbus unit ID configured on the meter.
+    #[arg(long, default_value_t = 1)]
+    meter_unit: u8,
+
+    /// Connection and individual register-read timeout in seconds.
+    #[arg(long, default_value_t = 5)]
+    meter_timeout_secs: u64,
+
+    /// SQLite file readings are appended to. Created if it does not exist.
+    #[arg(long, default_value = "pqmeter.db")]
+    db: PathBuf,
+
+    /// Number of seconds between meter reads.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_seconds)]
+    interval: f64,
+}
+
+fn parse_positive_seconds(value: &str) -> Result<f64, String> {
+    let seconds: f64 = value
+        .parse()
+        .map_err(|_| "must be a number of seconds".to_string())?;
+    if seconds.is_finite() && seconds > 0.0 {
+        Ok(seconds)
+    } else {
+        Err("must be greater than zero".to_string())
+    }
 }
 
 /// Arguments for `show`.
@@ -154,11 +195,45 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match (args.command, args.tunnel) {
+        (Some(Command::Record(record_args)), _) => record(record_args).await,
         (Some(Command::Show(show_args)), _) => show(show_args),
         (None, Some(tunnel_args)) => run(tunnel_args).await,
         (None, None) => Err(anyhow::anyhow!(
             "nothing to do: pass --endhost-api and --server to open the tunnel, or run `show`. See --help."
         )),
+    }
+}
+
+/// Polls the physical meter and persists every successful reading locally.
+async fn record(args: RecordArgs) -> anyhow::Result<()> {
+    let meter_addr = SocketAddr::new(args.meter_ip, args.meter_port);
+    let mut meter = meter::ModbusMeter::connect(
+        meter_addr,
+        args.meter_unit,
+        Duration::from_secs(args.meter_timeout_secs),
+    )
+    .await
+    .with_context(|| format!("connecting to the Modbus meter at {meter_addr}"))?;
+    let store = MeterStore::open(&args.db)
+        .with_context(|| format!("opening the database at {}", args.db.display()))?;
+    let interval = Duration::from_secs_f64(args.interval);
+    tracing::info!(meter = %meter_addr, database = %args.db.display(), ?interval, "recording meter readings");
+
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        match meter.read_snapshot().await {
+            Ok(snapshot) => match store.insert_now(snapshot.into()) {
+                Ok(()) => tracing::info!(
+                    voltage_l1_v = snapshot.voltage_l1_v,
+                    current_l1_a = snapshot.current_l1_a,
+                    active_power_l1_w = snapshot.active_power_l1_w,
+                    "stored meter reading"
+                ),
+                Err(err) => tracing::warn!(error = ?err, "failed to persist meter reading"),
+            },
+            Err(err) => tracing::warn!(error = ?err, "failed to read the meter"),
+        }
     }
 }
 
