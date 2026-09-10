@@ -1,5 +1,6 @@
 //! The meter data source: a [`MeterSource`] the gateway reads once per `"data"`
-//! request, and a [`DummyMeter`] that stands in for the real UMG 605-PRO.
+//! request, a [`ModbusMeter`] backed by the real UMG 605-PRO, and a
+//! [`DummyMeter`] for tests.
 //!
 //! A real implementation holds a connected `umg605_modbus_client::Umg605ProClient`
 //! and reads `voltage_l1`, `current_l1`, `power_l1_n`, `reactive_power_l1` and
@@ -7,10 +8,15 @@
 //! Boxing the trait here means wiring that in later is choosing which
 //! `Box<dyn MeterSource>` `main` constructs, not restructuring the gateway.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    net::SocketAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio_modbus::Slave;
+use umg605_modbus_client::Umg605ProClient;
 
 /// One set of readings taken at one moment. Field names and units are the wire
 /// contract described in `CONNECT_PROTOCOL.md`.
@@ -48,6 +54,37 @@ pub trait MeterSource: Send {
     /// protocol's `payload.index` backfill range is not implemented, so every
     /// reply carries exactly one snapshot.
     async fn read_snapshot(&mut self) -> anyhow::Result<MeterSnapshot>;
+}
+
+/// A [`MeterSource`] that reads a UMG 605-PRO over Modbus TCP.
+pub struct ModbusMeter {
+    client: Umg605ProClient,
+}
+
+impl ModbusMeter {
+    /// Connects to the meter at startup. The same connection is reused for
+    /// each snapshot.
+    pub async fn connect(
+        socket_addr: SocketAddr,
+        unit: u8,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let client = Umg605ProClient::connect_tcp(socket_addr, Slave(unit), timeout).await?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl MeterSource for ModbusMeter {
+    async fn read_snapshot(&mut self) -> anyhow::Result<MeterSnapshot> {
+        Ok(MeterSnapshot {
+            voltage_l1_v: self.client.voltage_l1().await? as f64,
+            current_l1_a: self.client.current_l1().await? as f64,
+            active_power_l1_w: self.client.power_l1_n().await? as f64,
+            reactive_power_l1_var: self.client.reactive_power_l1().await? as f64,
+            phase_angle_l1_deg: self.client.phase_angle_l1().await? as f64,
+        })
+    }
 }
 
 /// A stand-in for the real meter: plausible values that drift a little on

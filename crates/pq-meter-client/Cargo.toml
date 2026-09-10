@@ -20,8 +20,10 @@ sciparse = { workspace = true }
 serde_json = { workspace = true }
 snap-tokens = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "time"] }
+tokio-modbus = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+umg605-modbus-client = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

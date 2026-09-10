@@ -12,8 +12,7 @@
 //! everything after a given row id — as a table or as JSON lines.
 //!
 //! The meter itself is read through the [`meter::MeterSource`] trait; `main`
-//! wires in [`meter::DummyMeter`] today. See `scripts/run-dummy.sh` to run this
-//! against dummy data.
+//! wires in [`meter::ModbusMeter`].
 
 mod meter;
 // `show` uses most of `storage`; `query` (time-range reads) is exercised only
@@ -21,7 +20,12 @@ mod meter;
 #[allow(dead_code)]
 mod storage;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 use clap::Parser;
@@ -85,6 +89,22 @@ struct TunnelArgs {
     #[arg(long)]
     server: ScionSocketIpAddr,
 
+    /// IP address of the UMG 605-PRO Modbus TCP meter.
+    #[arg(long)]
+    meter_ip: IpAddr,
+
+    /// Modbus TCP port of the meter.
+    #[arg(long, default_value_t = umg605_modbus_client::DEFAULT_MODBUS_PORT)]
+    meter_port: u16,
+
+    /// Modbus unit ID configured on the meter.
+    #[arg(long, default_value_t = 1)]
+    meter_unit: u8,
+
+    /// Connection and individual register-read timeout in seconds.
+    #[arg(long, default_value_t = 5)]
+    meter_timeout_secs: u64,
+
     /// SQLite file every answered reading is also appended to. Created if it
     /// does not exist.
     #[arg(long, default_value = "pqmeter.db")]
@@ -115,14 +135,12 @@ struct ShowArgs {
     json: bool,
 }
 
-/// The gateway's persistent state: the meter it reads, the local database
-/// every reading is appended to, and the running index it stamps replies
-/// with. Outlives any single tunnel, so a reconnect picks up where the last
-/// one left off.
+/// The gateway's persistent state: the meter that records readings locally
+/// and the database from which tunnel responses are served. Outlives any
+/// single tunnel, so reconnects use the same cursorable history.
 struct Gateway {
     meter: Box<dyn MeterSource>,
     store: MeterStore,
-    next_index: u64,
 }
 
 #[tokio::main]
@@ -165,10 +183,17 @@ async fn run(args: TunnelArgs) -> anyhow::Result<()> {
 
     let store = MeterStore::open(&args.db)
         .with_context(|| format!("opening the database at {}", args.db.display()))?;
+    let meter_addr = SocketAddr::new(args.meter_ip, args.meter_port);
+    let meter = meter::ModbusMeter::connect(
+        meter_addr,
+        args.meter_unit,
+        Duration::from_secs(args.meter_timeout_secs),
+    )
+    .await
+    .with_context(|| format!("connecting to the Modbus meter at {meter_addr}"))?;
     let mut gateway = Gateway {
-        meter: Box::new(meter::DummyMeter::new()),
+        meter: Box::new(meter),
         store,
-        next_index: 1,
     };
 
     let mut backoff = INITIAL_BACKOFF;
@@ -287,7 +312,7 @@ where
                 .pointer("/payload/index")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            tracing::debug!(id, from_index, "answering data request");
+            tracing::debug!(id, from_index, "answering data request from local history");
             match gateway.meter.read_snapshot().await {
                 Ok(snapshot) => {
                     // Local persistence is a side channel: a failure to store the
@@ -297,13 +322,23 @@ where
                         tracing::warn!(id, error = ?err, "failed to persist reading");
                     }
 
-                    let index = gateway.next_index;
-                    gateway.next_index += 1;
-                    json!({
-                        "type": "data",
-                        "id": id,
-                        "payload": { "data": [snapshot.to_json(index)] },
-                    })
+                    match gateway.store.since_id(from_index as i64, 10_000) {
+                        Ok(readings) => json!({
+                            "type": "data",
+                            "id": id,
+                            "payload": {
+                                "data": readings.iter().map(stored_reading_json).collect::<Vec<_>>(),
+                            },
+                        }),
+                        Err(err) => {
+                            tracing::warn!(id, error = ?err, "failed to read stored readings");
+                            json!({
+                                "type": "error",
+                                "id": id,
+                                "payload": { "message": "unable to load stored readings" },
+                            })
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(id, error = ?err, "meter read failed");
@@ -366,16 +401,22 @@ fn select_rows(store: &MeterStore, args: &ShowArgs) -> anyhow::Result<Vec<Stored
 }
 
 fn row_json(row: &StoredReading) -> String {
+    stored_reading_json(row).to_string()
+}
+
+/// Renders a stored reading in the wire format, using its SQLite row id as
+/// the incremental response cursor.
+fn stored_reading_json(row: &StoredReading) -> Value {
     json!({
         "id": row.id,
-        "ts_millis": row.reading.ts_millis,
+        "timestamp": row.reading.ts_millis.to_string(),
         "voltage_l1_v": row.reading.voltage_l1,
         "current_l1_a": row.reading.current_l1,
         "active_power_l1_w": row.reading.real_power_l1,
         "reactive_power_l1_var": row.reading.reactive_power_l1,
         "phase_angle_l1_deg": row.reading.phase_angle_l1,
+        "index": row.id,
     })
-    .to_string()
 }
 
 fn print_table(rows: &[StoredReading]) {
@@ -427,7 +468,6 @@ mod tests {
         Gateway {
             meter: Box::new(meter::DummyMeter::new()),
             store: MeterStore::open(std::path::Path::new(":memory:")).expect("in-memory store"),
-            next_index: 1,
         }
     }
 
@@ -471,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_request_is_answered_with_a_snapshot() {
+    async fn data_request_is_answered_with_stored_readings() {
         let mut gateway = test_gateway();
         let input = ndjson(&[json!({"type": "data", "id": 42, "payload": {}})]);
         let (result, replies) = serve_input(&mut gateway, &input).await;
@@ -499,11 +539,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_request_returns_only_rows_after_its_index() {
+        let mut gateway = test_gateway();
+        for ts in [100, 200, 300] {
+            gateway
+                .store
+                .insert(&storage::Reading {
+                    ts_millis: ts,
+                    voltage_l1: 230.0,
+                    current_l1: 5.0,
+                    real_power_l1: 1_150.0,
+                    reactive_power_l1: 60.0,
+                    phase_angle_l1: 3.0,
+                })
+                .unwrap();
+        }
+        let input = ndjson(&[json!({"type": "data", "id": 1, "payload": {"index": 1}})]);
+        let (_, replies) = serve_input(&mut gateway, &input).await;
+
+        let data = parse_replies(&replies)[0]["payload"]["data"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(data.len(), 3);
+        assert_eq!(data[0]["index"], 2);
+        assert_eq!(data[1]["index"], 3);
+        assert_eq!(data[2]["index"], 4);
+    }
+
+    #[tokio::test]
     async fn index_increases_across_requests() {
         let mut gateway = test_gateway();
         let input = ndjson(&[
             json!({"type": "data", "id": 1, "payload": {}}),
-            json!({"type": "data", "id": 2, "payload": {}}),
+            json!({"type": "data", "id": 2, "payload": {"index": 1}}),
         ]);
         let (result, replies) = serve_input(&mut gateway, &input).await;
         result.expect("serve_tunnel should exit cleanly on EOF");
@@ -548,7 +617,6 @@ mod tests {
         let mut gateway = Gateway {
             meter: Box::new(BrokenMeter),
             store: MeterStore::open(std::path::Path::new(":memory:")).expect("in-memory store"),
-            next_index: 1,
         };
         let input = ndjson(&[json!({"type": "data", "id": 1, "payload": {}})]);
         let (result, replies) = serve_input(&mut gateway, &input).await;
@@ -587,12 +655,15 @@ mod tests {
             "http://127.0.0.1:31000/",
             "--server",
             "[2-ff00:0:212,127.0.0.1]:59218",
+            "--meter-ip",
+            "192.168.1.50",
         ])
         .unwrap();
 
         assert!(args.command.is_none());
         let tunnel = args.tunnel.expect("tunnel args parsed");
         assert_eq!(tunnel.db, PathBuf::from("pqmeter.db"));
+        assert_eq!(tunnel.meter_ip.to_string(), "192.168.1.50");
     }
 
     #[test]
