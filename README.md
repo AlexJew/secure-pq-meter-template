@@ -24,12 +24,14 @@ crates/
     src/network.rs         The simulated SCION network (which ASes, which addresses)
     src/api.rs             The HTTP/3 endpoint; serves CONNECT data tunnels and a POST route
   pq-meter-client/         Runs on the gateway
-    src/main.rs            Opens a CONNECT tunnel and serves measurements through it
+    src/main.rs            Maintains the CONNECT tunnel, records and serves readings
+    src/meter.rs           The MeterSource trait and the Modbus-backed meter implementation
   umg605-modbus-client/    Reads data from a UMG 605-PRO power quality meter over Modbus TCP
     src/lib.rs             The Modbus TCP client and the registers it reads
     bin/pinger.rs          Example binary that reads values from the meter
 Cargo.toml                 Workspace, pins the SCION SDK version
 rust-toolchain.toml        Rust version used to build this repository
+scripts/run-dummy.sh       Runs the client against its dummy meter, see below
 ```
 
 The server and client are built on the [SCION endhost SDK](https://github.com/Anapaya/scion-sdk),
@@ -97,18 +99,19 @@ Copy that command into a second terminal and run it through cargo:
 ```bash
 cargo run -p pq-meter-client -- \
   --endhost-api http://127.0.0.1:31000/ \
-  --server '[2-ff00:0:212,127.0.0.1]:59218'
+  --server '[2-ff00:0:212,127.0.0.1]:59218' \
+  --meter-ip 192.168.1.50
 ```
 
 The client opens a bidirectional `CONNECT` tunnel and stays connected. Every 5
 seconds the server pulls new measurements through the tunnel; the client
-generates a fake measurement per second and answers each pull with everything
-it has not sent yet. The server prints each measurement and keeps them in
-`data.json`:
+records one fresh Modbus snapshot in its SQLite database, then answers with
+every stored row after the server's cursor. The server prints each measurement
+and keeps them in `data.json`:
 
 ```text
 data tunnel opened by Some("[2-ff00:0:212,127.0.0.1]:59218")
-data: {"index":1,"timestamp":"2026-09-10T17:17:32.108Z","value1":230.01,"value2":1.6}
+data: {"index":1,"timestamp":"1789050000000","voltage_l1_v":230.01,"current_l1_a":1.6}
 received 1 measurement(s) from the gateway
 ```
 
@@ -119,6 +122,23 @@ you want a plain request/response to poke at.
 
 Note that the port of the server address (`59218` above) is assigned by the SNAP and is
 different on every start, so take the address from the output rather than from this README.
+
+## Run against dummy meter data
+
+`pq-meter-client` reads the meter through the `meter::MeterSource` trait
+(`crates/pq-meter-client/src/meter.rs`); today `main` wires in a `DummyMeter` that produces
+plausible, slowly drifting readings with no hardware attached. `scripts/run-dummy.sh` exercises
+this:
+
+```bash
+scripts/run-dummy.sh          # hermetic: builds, then runs the client's tests, printing
+                               # a real dummy "data" reply. No server or network needed.
+scripts/run-dummy.sh --live   # starts pq-meter-server, scrapes its address, and points
+                               # the client at it (see the CONNECT note above).
+```
+
+See `METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`, and the script fit
+together, and how to plug in the real Modbus-backed meter later.
 
 ## Run it between the Pi and the laptop
 
@@ -193,6 +213,54 @@ Which register holds which value is in the [register map of the meter][register-
 You can look at the example functions provided in the library to see how to read other values.
 
 [register-map]: https://assets.janitza.com/ce18jq9ih0x6/b83ae2356a42a682591109/ef2bc2b24a6b7c77de4dbda20e43cebf/janitza-mal-umg605pro-en.pdf
+
+## Record readings on the Pi
+
+`pq-meter-client` has a `record` subcommand that reads the L1 values from the meter on an
+interval and appends each one, with a timestamp, to a local SQLite file:
+
+```bash
+./pq-meter-client record --meter-ip 192.168.1.50 --db pqmeter.db --interval 1
+```
+
+```text
+recording 192.168.1.50:502 to pqmeter.db every 1.00s
+stored: 230.12 V, 1.83 A, 420.75 W, 12.50 var, 3.20 deg
+```
+
+A read that fails (a meter blip, a timeout) is logged and skipped; the loop keeps going.
+Stop it with Ctrl-C — every reading is already committed, so nothing is lost.
+
+### Read the readings back
+
+The same binary has a `show` subcommand, so you can look at the data over SSH without
+installing anything:
+
+```bash
+./pq-meter-client show --db pqmeter.db                 # the last 20, newest first
+./pq-meter-client show --db pqmeter.db --last 100
+./pq-meter-client show --db pqmeter.db --since-id 5000  # everything after row 5000
+./pq-meter-client show --db pqmeter.db --json           # one JSON object per line
+```
+
+```text
+      id  time (UTC)               V L1     A L1       W L1     var L1   deg L1
+       3  2026-09-10 15:53:02    230.12     1.83     420.75      12.50     3.20
+```
+
+`--since-id` is the cursor for an incremental consumer (a query endpoint the server polls):
+keep the largest `id` you have seen and pass it next time. That endpoint is not built yet.
+
+Reading with `show` while `record` is running is fine — the database is in WAL mode, so the
+reader and the writer do not block each other. If you prefer raw SQL and have `sqlite3`
+installed (`sudo apt install sqlite3`), the file is an ordinary SQLite database:
+
+```bash
+sqlite3 pqmeter.db "SELECT * FROM readings ORDER BY ts_millis DESC LIMIT 10"
+scp <user>@<hostname>.local:pqmeter.db .   # or copy it to the laptop
+```
+
+Running the client with no subcommand still sends one message over SCION as before.
 
 ## Installing the build tools
 
@@ -292,18 +360,15 @@ cargo cross build --release -p umg605-modbus-client --bin pinger --target aarch6
 ```
 
 ## Where to continue
-* **Read the meter.** `pq-meter-client` already depends on `umg605-modbus-client`, so
-  `use umg605_modbus_client::Umg605ProClient;` in `crates/pq-meter-client/src/main.rs` is
-  enough to read a value and store it in `measurements`. Check the meter with the
-  `pinger` [first](#read-from-the-meter).
-* **Send your own data.** The client answers the server's pulls in `serve()` in
-  `crates/pq-meter-client/src/main.rs`: it filters `measurements` by index and sends the
-  rest over the tunnel. Build whatever measurement structure you need in `measurement()`
-  and decide there how often new ones appear.
-* **Receive your own data.** The server's tunnel session is `tunnel_session()` in
-  `crates/pq-meter-server/src/api.rs`; it prints each measurement and keeps them in
-  `data.json`. Everything that is not a `CONNECT` still goes through the axum router, so
-  you can add more routes the usual way.
+
+* **Read the meter.** `pq-meter-client` reads through the `meter::MeterSource` trait
+  (`crates/pq-meter-client/src/meter.rs`), using a connected `Umg605ProClient` to collect the
+  L1 values. Check the meter with the `pinger` [first](#read-from-the-meter).
+* **Send your own data.** The client returns stored SQLite rows from `handle_line()` in
+  `crates/pq-meter-client/src/main.rs`, using SQLite row IDs as the incremental protocol index.
+* **Receive your own data.** The server's `tunnel_session()` in `crates/pq-meter-server/src/api.rs`
+  prints each measurement and keeps them in `data.json`. Everything other than `CONNECT` still
+  goes through the Axum router.
 * **Look at paths.** SCION lets an application see and choose the paths to a destination. The
   [academy](https://learn.anapaya.net/docs/academy/scion-sdk/) explains how paths are built,
   and `crates/pq-meter-server/src/network.rs` is where you would add more autonomous systems

@@ -69,19 +69,33 @@ async fn monitor(client: &mut Umg605ProClient, period: Duration) -> anyhow::Resu
         let elapsed1 = start.elapsed();
         let current_l1 = client.current_l1().await?;
         let elapsed2 = start.elapsed();
-        let power_l1_n = client.power_l1_n().await?;
+        let real_power_l1 = client.power_l1_n().await?;
         let elapsed3 = start.elapsed();
+        let reactive_power_l1 = client.reactive_power_l1().await?;
+        let elapsed4 = start.elapsed();
+        let phase_angle_l1 = client.phase_angle_l1().await?;
+        let elapsed5 = start.elapsed();
 
-        if elapsed3 > period {
+        if elapsed5 > period {
             eprintln!(
-                "Warning: Reading values took longer than the {:.2?} interval: {:.2?} + {:.2?} + {:.2?} = {:.2?}",
-                period, elapsed1, elapsed2 - elapsed1, elapsed3 - elapsed2, elapsed3
+                "Warning: Reading values took longer than the {:.2?} interval: {:.2?} + {:.2?} + {:.2?} + {:.2?} + {:.2?} = {:.2?}",
+                period,
+                elapsed1,
+                elapsed2 - elapsed1,
+                elapsed3 - elapsed2,
+                elapsed4 - elapsed3,
+                elapsed5 - elapsed4,
+                elapsed5
             );
         }
 
         println!(
-            "Voltage L1: {:.2} V, Current L1: {:.2} A, Power L1-N: {:.2} W",
-            voltage_l1, current_l1, power_l1_n
+            "Voltage L1-N: {:.2} V, Current L1: {:.2} A, Real power L1: {:.2} W, Reactive power L1: {:.2} var, Phase angle L1: {:.2} deg",
+            voltage_l1,
+            current_l1,
+            real_power_l1,
+            reactive_power_l1,
+            phase_angle_l1
         );
     }
 }
