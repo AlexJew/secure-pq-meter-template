@@ -10,7 +10,7 @@
 mod api;
 mod network;
 
-use std::{net::IpAddr, sync::Arc};
+use std::{net::IpAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
@@ -35,6 +35,10 @@ struct Args {
     /// Path the HTTP/3 server accepts POST requests on.
     #[arg(long, default_value = api::DEFAULT_PATH)]
     path: String,
+
+    /// File the received meter data is written to.
+    #[arg(long, default_value = "data.json")]
+    data_file: PathBuf,
 }
 
 #[tokio::main]
@@ -49,6 +53,11 @@ async fn main() -> anyhow::Result<()> {
 
     // The SDK uses rustls for its control plane; pick a crypto backend.
     scion_sdk_utils::rustls::select_ring_crypto_provider();
+
+    // Start the data file fresh; the tunnels rewrite it as they receive data.
+    std::fs::File::create(&args.data_file).with_context(|| {
+        format!("creating the data file {}", args.data_file.display())
+    })?;
 
     let network = network::start(args.bind_ip).await?;
 
@@ -69,7 +78,12 @@ async fn main() -> anyhow::Result<()> {
     println!("SCION network is up");
     println!("  gateway endhost API: {}", network.gateway_endhost_api);
     println!("  HTTP/3 server:       {server_address}");
+    println!(
+        "  accepting CONNECT tunnels (pulling data every {}s)",
+        api::PULL_INTERVAL.as_secs()
+    );
     println!("  accepting POST on:   {}", args.path);
+    println!("  writing data to:     {}", args.data_file.display());
     println!();
     println!("Start the client with:");
     // The address is quoted because a shell would otherwise read the square brackets as a
@@ -83,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     api::serve(
         Arc::new(socket) as Arc<dyn GenericScionUdpSocket>,
         &args.path,
+        &args.data_file,
     )
     .await
 }

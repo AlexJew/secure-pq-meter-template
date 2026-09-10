@@ -22,9 +22,9 @@ crates/
   pq-meter-server/         Runs on the laptop
     src/main.rs            Command line interface, starts everything
     src/network.rs         The simulated SCION network (which ASes, which addresses)
-    src/api.rs             The HTTP/3 endpoint that receives the data
+    src/api.rs             The HTTP/3 endpoint; serves CONNECT data tunnels and a POST route
   pq-meter-client/         Runs on the gateway
-    src/main.rs            Sends one message and prints the answer
+    src/main.rs            Opens a CONNECT tunnel and serves measurements through it
   umg605-modbus-client/    Reads data from a UMG 605-PRO power quality meter over Modbus TCP
     src/lib.rs             The Modbus TCP client and the registers it reads
     bin/pinger.rs          Example binary that reads values from the meter
@@ -46,8 +46,8 @@ when a term in this README is new to you. The API reference is on
  ┌──────────────────────────┐              ┌───────────────────────────────────────┐
  │ pq-meter-client          │              │ pq-meter-server                       │
  │                          │  your WLAN   │  ┌─────────────────────────────────┐  │
- │  SCION stack ────────────┼─────────────►│  │ PocketSCION                     │  │
- │   HTTP/3 POST            │              │  │  1-ff00:0:132 ─── 2-ff00:0:212  │  │
+  │  SCION stack ────────────┼─────────────►│  │ PocketSCION                     │  │
+  │   HTTP/3 CONNECT tunnel  │              │  │  1-ff00:0:132 ─── 2-ff00:0:212  │  │
  │                          │              │  └─────────────────────────────────┘  │
  │                          │              │  HTTP/3 server in 2-ff00:0:212        │
  └──────────────────────────┘              └───────────────────────────────────────┘
@@ -84,7 +84,9 @@ It prints, among the log lines:
 SCION network is up
   gateway endhost API: http://127.0.0.1:31000/
   HTTP/3 server:       [2-ff00:0:212,127.0.0.1]:59218
+  accepting CONNECT tunnels (pulling data every 5s)
   accepting POST on:   /edh/v1/hello
+  writing data to:     data.json
 
 Start the client with:
   pq-meter-client --endhost-api http://127.0.0.1:31000/ --server '[2-ff00:0:212,127.0.0.1]:59218'
@@ -98,14 +100,22 @@ cargo run -p pq-meter-client -- \
   --server '[2-ff00:0:212,127.0.0.1]:59218'
 ```
 
-The client prints `server answered 200 OK: ok`, and the server prints what it received:
+The client opens a bidirectional `CONNECT` tunnel and stays connected. Every 5
+seconds the server pulls new measurements through the tunnel; the client
+generates a fake measurement per second and answers each pull with everything
+it has not sent yet. The server prints each measurement and keeps them in
+`data.json`:
 
 ```text
-received: {"message":"Hello from Energy Data Hackdays 2026"}
+data tunnel opened by Some("[2-ff00:0:212,127.0.0.1]:59218")
+data: {"index":1,"timestamp":"2026-09-10T17:17:32.108Z","value1":230.01,"value2":1.6}
+received 1 measurement(s) from the gateway
 ```
 
-The server keeps running; the client sends one message and exits. Use `--message` to send
-something else.
+The server and the client both keep running; stop them with Ctrl-C.
+
+The `POST /edh/v1/hello` endpoint from the original template still works, if
+you want a plain request/response to poke at.
 
 Note that the port of the server address (`59218` above) is assigned by the SNAP and is
 different on every start, so take the address from the output rather than from this README.
@@ -125,8 +135,7 @@ The printed URLs and addresses now use that IP address. Run the client on the Pi
 ```bash
 ./pq-meter-client \
   --endhost-api http://192.168.1.42:31000/ \
-  --server '[2-ff00:0:212,192.168.1.42]:59218' \
-  --message '{"my":"first measurement"}'
+  --server '[2-ff00:0:212,192.168.1.42]:59218'
 ```
 
 The server binds these ports on the address you pass, and all of them have to be reachable
@@ -283,18 +292,18 @@ cargo cross build --release -p umg605-modbus-client --bin pinger --target aarch6
 ```
 
 ## Where to continue
-
 * **Read the meter.** `pq-meter-client` already depends on `umg605-modbus-client`, so
   `use umg605_modbus_client::Umg605ProClient;` in `crates/pq-meter-client/src/main.rs` is
-  enough to read a value and send it on. Check the meter with the `pinger` [first](#read-from-the-meter).
-* **Send your own data.** The client sends a JSON object with one field. Build whatever
-  structure your measurements need in `crates/pq-meter-client/src/main.rs`, and send in a
-  loop instead of once. Keep the one `scion_http3::Client`: it holds a pool of connections,
-  so every request after the first one reuses the connection that is already up.
-* **Receive your own data.** The server prints the request body as text
-  (`crates/pq-meter-server/src/api.rs`). It is a normal [axum](https://docs.rs/axum)
-  application, so you can add routes, and let axum parse your JSON into a type by taking
-  `axum::Json<YourType>` as the handler argument.
+  enough to read a value and store it in `measurements`. Check the meter with the
+  `pinger` [first](#read-from-the-meter).
+* **Send your own data.** The client answers the server's pulls in `serve()` in
+  `crates/pq-meter-client/src/main.rs`: it filters `measurements` by index and sends the
+  rest over the tunnel. Build whatever measurement structure you need in `measurement()`
+  and decide there how often new ones appear.
+* **Receive your own data.** The server's tunnel session is `tunnel_session()` in
+  `crates/pq-meter-server/src/api.rs`; it prints each measurement and keeps them in
+  `data.json`. Everything that is not a `CONNECT` still goes through the axum router, so
+  you can add more routes the usual way.
 * **Look at paths.** SCION lets an application see and choose the paths to a destination. The
   [academy](https://learn.anapaya.net/docs/academy/scion-sdk/) explains how paths are built,
   and `crates/pq-meter-server/src/network.rs` is where you would add more autonomous systems
