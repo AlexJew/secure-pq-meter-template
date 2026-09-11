@@ -28,8 +28,12 @@ export class WaveformPanel {
   readonly powerFactor = input<number | undefined>(undefined);
 
   // Bumped on an interval so `harmonicsResource`'s URL function re-runs and
-  // re-fetches — see app.ts's identical pattern for why.
-  private readonly poll = signal(0);
+  // re-fetches — see app.ts's identical pattern for why. Also drives the
+  // bottom progress bar: the template keys its `@for` on this value, so the
+  // bar element is destroyed and recreated every cycle, restarting its
+  // fill animation from empty in sync with the poll.
+  protected readonly poll = signal(0);
+  protected readonly pollIntervalMs = POLL_INTERVAL_MS;
 
   private readonly harmonicsResource = httpResource<Harmonics | null>(
     () => {
@@ -83,7 +87,15 @@ export class WaveformPanel {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      plugins: { legend: { display: true, labels: { boxWidth: 12 } } },
+      layout: { padding: { top: 8 } },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'center',
+          labels: { boxWidth: 24, boxHeight: 16, padding: 20, font: { size: 15 } },
+        },
+      },
       scales: {
         x: {
           grid: { display: false },

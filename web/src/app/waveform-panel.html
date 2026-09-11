@@ -35,4 +35,9 @@
       </div>
     </aside>
   </div>
+  <div class="progress-track" title="Time until the next refresh">
+    @for (cycle of [poll()]; track cycle) {
+      <div class="progress-fill" [style.animationDuration.ms]="pollIntervalMs"></div>
+    }
+  </div>
 </section>
