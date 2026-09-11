@@ -9,4 +9,5 @@ export interface Reading {
   active_power_l1_w: number;
   reactive_power_l1_var: number;
   phase_angle_l1_deg: number;
+  power_factor_l1: number;
 }

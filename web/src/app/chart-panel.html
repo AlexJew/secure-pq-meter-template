@@ -1,8 +1,8 @@
 <section class="panel">
   <header>
-    <h2>Active power · L1</h2>
+    <h2>{{ title() }}</h2>
   </header>
   <div class="chart">
-    <canvas baseChart [data]="data()" [options]="options" [type]="'line'"></canvas>
+    <canvas baseChart [data]="data()" [options]="options()" [type]="'line'"></canvas>
   </div>
 </section>

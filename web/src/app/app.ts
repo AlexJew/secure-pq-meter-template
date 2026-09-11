@@ -1,8 +1,13 @@
 import { httpResource } from '@angular/common/http';
 import { Component, signal } from '@angular/core';
-import { ChartPanel } from './chart-panel';
+import { ChartPanel, Series } from './chart-panel';
 import { Reading } from './models/reading';
 import { WaveformPanel } from './waveform-panel';
+
+const POWER_SERIES: Series[] = [
+  { label: 'Active power (W)', color: '#2563eb', unit: 'W', axis: 'left', value: (reading) => reading.active_power_l1_w },
+  { label: 'Power factor', color: '#16a34a', unit: '', axis: 'right', value: (reading) => reading.power_factor_l1 },
+];
 
 // Matches pq-meter-server's web_api::READINGS_PATH; the dev proxy
 // (proxy.conf.json) forwards it to the server's plain-HTTP data API.
@@ -34,6 +39,7 @@ export class App {
   );
 
   protected readonly readings = this.readingsResource.value;
+  protected readonly powerSeries = POWER_SERIES;
 
   constructor() {
     setInterval(() => this.poll.update((value) => value + 1), POLL_INTERVAL_MS);
