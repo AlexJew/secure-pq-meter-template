@@ -12,7 +12,8 @@
 //! everything after a given row id — as a table or as JSON lines.
 //!
 //! The meter itself is read through the [`meter::MeterSource`] trait; `main`
-//! wires in [`meter::ModbusMeter`].
+//! wires in [`meter::ModbusMeter`], or [`meter::DummyMeter`] when `--dummy-meter`
+//! is passed (see `scripts/run-dummy.sh --live`).
 
 mod meter;
 // `show` uses most of `storage`; `query` (time-range reads) is exercised only
@@ -92,8 +93,8 @@ struct TunnelArgs {
     server: ScionSocketIpAddr,
 
     /// IP address of the UMG 605-PRO Modbus TCP meter.
-    #[arg(long)]
-    meter_ip: IpAddr,
+    #[arg(long, required_unless_present = "dummy_meter", conflicts_with = "dummy_meter")]
+    meter_ip: Option<IpAddr>,
 
     /// Modbus TCP port of the meter.
     #[arg(long, default_value_t = umg605_modbus_client::DEFAULT_MODBUS_PORT)]
@@ -106,6 +107,12 @@ struct TunnelArgs {
     /// Connection and individual register-read timeout in seconds.
     #[arg(long, default_value_t = 5)]
     meter_timeout_secs: u64,
+
+    /// Use a simulated meter with plausible drifting values instead of
+    /// connecting to real hardware, for demos and tests (see
+    /// `scripts/run-dummy.sh --live`).
+    #[arg(long)]
+    dummy_meter: bool,
 
     /// SQLite file every answered reading is also appended to. Created if it
     /// does not exist.
@@ -258,18 +265,21 @@ async fn run(args: TunnelArgs) -> anyhow::Result<()> {
 
     let store = MeterStore::open(&args.db)
         .with_context(|| format!("opening the database at {}", args.db.display()))?;
-    let meter_addr = SocketAddr::new(args.meter_ip, args.meter_port);
-    let meter = meter::ModbusMeter::connect(
-        meter_addr,
-        args.meter_unit,
-        Duration::from_secs(args.meter_timeout_secs),
-    )
-    .await
-    .with_context(|| format!("connecting to the Modbus meter at {meter_addr}"))?;
-    let mut gateway = Gateway {
-        meter: Box::new(meter),
-        store,
+    let meter: Box<dyn MeterSource> = if args.dummy_meter {
+        Box::new(meter::DummyMeter::new())
+    } else {
+        // `required_unless_present = "dummy_meter"` guarantees this is `Some`.
+        let meter_addr = SocketAddr::new(args.meter_ip.unwrap(), args.meter_port);
+        let modbus_meter = meter::ModbusMeter::connect(
+            meter_addr,
+            args.meter_unit,
+            Duration::from_secs(args.meter_timeout_secs),
+        )
+        .await
+        .with_context(|| format!("connecting to the Modbus meter at {meter_addr}"))?;
+        Box::new(modbus_meter)
     };
+    let mut gateway = Gateway { meter, store };
 
     let mut backoff = INITIAL_BACKOFF;
     loop {
@@ -738,7 +748,55 @@ mod tests {
         assert!(args.command.is_none());
         let tunnel = args.tunnel.expect("tunnel args parsed");
         assert_eq!(tunnel.db, PathBuf::from("pqmeter.db"));
-        assert_eq!(tunnel.meter_ip.to_string(), "192.168.1.50");
+        assert_eq!(tunnel.meter_ip.unwrap().to_string(), "192.168.1.50");
+    }
+
+    #[test]
+    fn dummy_meter_flag_does_not_require_meter_ip() {
+        let args = Args::try_parse_from([
+            "pq-meter-client",
+            "--endhost-api",
+            "http://127.0.0.1:31000/",
+            "--server",
+            "[2-ff00:0:212,127.0.0.1]:59218",
+            "--dummy-meter",
+        ])
+        .unwrap();
+
+        let tunnel = args.tunnel.expect("tunnel args parsed");
+        assert!(tunnel.dummy_meter);
+        assert_eq!(tunnel.meter_ip, None);
+    }
+
+    #[test]
+    fn meter_ip_and_dummy_meter_are_mutually_exclusive() {
+        assert!(
+            Args::try_parse_from([
+                "pq-meter-client",
+                "--endhost-api",
+                "http://127.0.0.1:31000/",
+                "--server",
+                "[2-ff00:0:212,127.0.0.1]:59218",
+                "--meter-ip",
+                "192.168.1.50",
+                "--dummy-meter",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn neither_meter_ip_nor_dummy_meter_is_rejected() {
+        assert!(
+            Args::try_parse_from([
+                "pq-meter-client",
+                "--endhost-api",
+                "http://127.0.0.1:31000/",
+                "--server",
+                "[2-ff00:0:212,127.0.0.1]:59218",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

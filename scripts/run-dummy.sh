@@ -31,10 +31,11 @@ case "$mode" in
 
   log=$(mktemp "${TMPDIR:-/tmp}/pq-meter-server.XXXXXX")
   server_pid=""
+  tail_pid=""
   client_pid=""
 
   cleanup() {
-    for pid in "$client_pid" "$server_pid"; do
+    for pid in "$client_pid" "$server_pid" "$tail_pid"; do
       if [ -n "$pid" ]; then
         kill "$pid" >/dev/null 2>&1 || true
         wait "$pid" 2>/dev/null || true
@@ -85,11 +86,23 @@ case "$mode" in
   echo "    endhost API: $endhost_api"
   echo "    server:      $server_addr"
   echo
-  echo "NOTE: pq-meter-server does not implement the CONNECT tunnel endpoint yet"
-  echo "      (see CONNECT_PROTOCOL.md), so the client below is expected to log"
-  echo "      a 404 and back off/retry -- that is not a broken setup."
-  echo "      Press Ctrl-C to stop; the server is shut down with it."
+  echo "NOTE: the client below opens a CONNECT tunnel and answers the server's"
+  echo "      dummy-meter data requests over it (see CONNECT_PROTOCOL.md)."
+  echo "      Below, the client's own tracing lines (timestamped, INFO/WARN)"
+  echo "      are interleaved with the server's plain 'data: ...' /"
+  echo "      'received N measurement(s)...' lines, tailed live from $log."
+  echo "      Press Ctrl-C to stop both."
   echo
+
+  # Tail only what the server prints from here on -- its startup lines were
+  # already surfaced above via the sed scrape. A plain `tail -f`, not piped
+  # through anything, so `tail_pid` below is the actual process to kill on
+  # cleanup: piping it through e.g. `sed` for a line prefix would make `$!`
+  # the pid of that downstream command instead, and killing only that leaves
+  # `tail` an orphan once the log stops growing (it's blocked in a read, so
+  # it never gets SIGPIPE from the broken pipe to notice its reader is gone).
+  tail -n 0 -f "$log" &
+  tail_pid=$!
 
   # Backgrounded and `wait`-ed rather than run as a plain foreground command:
   # bash only checks for a pending trap when a `wait` builtin is interrupted,
@@ -98,7 +111,8 @@ case "$mode" in
   # exited -- which, being a reconnect-forever daemon, it never does.
   ./target/debug/pq-meter-client \
     --endhost-api "$endhost_api" \
-    --server "$server_addr" &
+    --server "$server_addr" \
+    --dummy-meter &
   client_pid=$!
   wait "$client_pid"
   ;;

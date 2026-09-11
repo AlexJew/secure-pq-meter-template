@@ -137,8 +137,8 @@ scripts/run-dummy.sh --live   # starts pq-meter-server, scrapes its address, and
                                # the client at it (see the CONNECT note above).
 ```
 
-See `METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`, and the script fit
-together, and how to plug in the real Modbus-backed meter later.
+See `crates/pq-meter-client/METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`,
+the real Modbus-backed `ModbusMeter`, and the script fit together.
 
 ## Run it between the Pi and the laptop
 
