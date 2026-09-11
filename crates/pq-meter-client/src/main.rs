@@ -143,8 +143,9 @@ struct RecordArgs {
     #[arg(long, default_value = "pqmeter.db")]
     db: PathBuf,
 
-    /// Number of seconds between meter reads.
-    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_seconds)]
+    /// Number of seconds between meter reads. Defaults to the meter's own
+    /// 200ms measuring-window update rate.
+    #[arg(long, default_value_t = 0.2, value_parser = parse_positive_seconds)]
     interval: f64,
 }
 
@@ -900,16 +901,36 @@ mod tests {
         assert_eq!(ids, vec![5, 4]);
     }
 
+    /// Matches the field names [`meter::dummy::DummyMeter`] reports, so a test
+    /// can freely mix directly-inserted sample rows with rows the dummy meter
+    /// writes via a `"data"` request into the same store without tripping the
+    /// store's one-schema-per-file check.
     fn sample(ts_millis: i64) -> storage::Reading {
-        storage::Reading {
-            ts_millis,
-            values: vec![
-                ("voltage_l1_v".to_string(), 230.0),
-                ("current_l1_a".to_string(), 1.8),
-                ("active_power_l1_w".to_string(), 414.0),
-                ("reactive_power_l1_var".to_string(), 12.0),
-                ("phase_angle_l1_deg".to_string(), 3.0),
-            ],
+        let mut values = vec![
+            ("voltage_l1_v".to_string(), 230.0),
+            ("current_l1_a".to_string(), 1.8),
+            ("active_power_l1_w".to_string(), 414.0),
+            ("reactive_power_l1_var".to_string(), 12.0),
+            ("phase_angle_l1_deg".to_string(), 3.0),
+            ("power_factor_l1".to_string(), 0.95),
+            ("current_thd_l1_pct".to_string(), 8.0),
+            ("current_peak_positive_l1_a".to_string(), 7.5),
+            ("current_peak_negative_l1_a".to_string(), -7.3),
+            ("current_crest_factor_l1".to_string(), 1.6),
+            ("power_factor_sign_l1".to_string(), 1.0),
+            ("power_factor_fundamental_l1".to_string(), 0.97),
+        ];
+        // Matches DummyMeter's HARMONIC_COUNT (25) and field naming exactly.
+        for (base, unit) in [
+            ("voltage_harmonic_mag_l1", "v"),
+            ("voltage_harmonic_phase_l1", "deg"),
+            ("current_harmonic_mag_l1", "a"),
+            ("current_harmonic_phase_l1", "deg"),
+        ] {
+            for order in 1..=25 {
+                values.push((format!("{base}_h{order}_{unit}"), 1.0));
+            }
         }
+        storage::Reading { ts_millis, values }
     }
 }

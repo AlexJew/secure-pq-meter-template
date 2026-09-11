@@ -21,9 +21,13 @@ use serde_json::{Value, json};
 /// One measured quantity. `name` is the wire field name; per the convention in
 /// `CONNECT_PROTOCOL.md`, the unit is already encoded in it (e.g.
 /// `"voltage_l1_v"`), so no separate unit type is needed here.
-#[derive(Debug, Clone, Copy)]
+///
+/// `name` is owned rather than `&'static str` because some `MeterSource`s
+/// generate names at runtime (for example one name per harmonic index), not
+/// just from a fixed set of literals.
+#[derive(Debug, Clone)]
 pub struct Reading {
-    pub name: &'static str,
+    pub name: String,
     pub value: f64,
 }
 
@@ -66,6 +70,21 @@ pub trait MeterSource: Send {
     async fn read_snapshot(&mut self) -> anyhow::Result<MeterSnapshot>;
 }
 
+/// Appends one [`Reading`] per entry of `magnitudes`, named
+/// `"{base}_h{order}_{unit}"` where `order` is the 1-based harmonic order —
+/// index 0 is the fundamental (1st harmonic), per the UMG 605-PRO datasheet's
+/// own `xxx[0]` = mains frequency convention. Shared by [`umg605::ModbusMeter`]
+/// and [`dummy::DummyMeter`] so both name their harmonic arrays the same way.
+pub(crate) fn push_harmonic_array(readings: &mut Vec<Reading>, base: &str, unit: &str, magnitudes: Vec<f32>) {
+    for (index, value) in magnitudes.into_iter().enumerate() {
+        let order = index + 1;
+        readings.push(Reading {
+            name: format!("{base}_h{order}_{unit}"),
+            value: value as f64,
+        });
+    }
+}
+
 /// The current time as milliseconds since the Unix epoch.
 fn unix_timestamp_millis() -> u128 {
     SystemTime::now()
@@ -84,8 +103,8 @@ mod tests {
     fn snapshot_json_has_wire_fields() {
         let snapshot = MeterSnapshot {
             readings: vec![
-                Reading { name: "voltage_l1_v", value: 231.5 },
-                Reading { name: "current_l1_a", value: 5.2 },
+                Reading { name: "voltage_l1_v".to_string(), value: 231.5 },
+                Reading { name: "current_l1_a".to_string(), value: 5.2 },
             ],
         };
         let value = snapshot.to_json(7);
