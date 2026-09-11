@@ -33,74 +33,68 @@ export class WaveformPanel {
 
   protected readonly harmonics = this.harmonicsResource.value;
 
-  protected readonly voltageData = computed<ChartData<'line', number[]>>(() =>
-    this.waveformData(this.harmonics()?.voltage.a, this.harmonics()?.voltage.phi_deg, 'Voltage', '#2563eb'),
-  );
-  protected readonly currentData = computed<ChartData<'line', number[]>>(() =>
-    this.waveformData(this.harmonics()?.current.b, this.harmonics()?.current.gamma_deg, 'Current', '#d97706'),
-  );
+  // Voltage on the left axis (V), current on the right (A) — same overlay
+  // pattern as app.ts's combined active-power/power-factor chart.
+  protected readonly data = computed<ChartData<'line', number[]>>(() => {
+    const h = this.harmonics();
+    if (!h) {
+      return { labels: [], datasets: [] };
+    }
 
-  protected readonly voltageOptions = this.axisOptions('V');
-  protected readonly currentOptions = this.axisOptions('A');
+    const voltage = synthesizeWaveform(h.voltage.a, h.voltage.phi_deg, h.frequency_hz, h.window_ms);
+    const current = synthesizeWaveform(h.current.b, h.current.gamma_deg, h.frequency_hz, h.window_ms);
+
+    return {
+      labels: voltage.timesMs.map((t) => t.toFixed(1)),
+      datasets: [
+        line('Voltage (ideal)', voltage.ideal, '#93c5fd', 'y', true),
+        line('Voltage (real)', voltage.real, '#2563eb', 'y', false),
+        line('Current (ideal)', current.ideal, '#fdba74', 'y1', true),
+        line('Current (real)', current.real, '#d97706', 'y1', false),
+      ],
+    };
+  });
+
+  protected readonly options: ChartOptions<'line'> = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: { legend: { display: true, labels: { boxWidth: 12 } } },
+    scales: {
+      x: {
+        grid: { display: false },
+        title: { display: true, text: 'ms' },
+        ticks: { maxTicksLimit: 8, maxRotation: 0 },
+      },
+      y: {
+        type: 'linear',
+        position: 'left',
+        title: { display: true, text: 'V' },
+      },
+      y1: {
+        type: 'linear',
+        position: 'right',
+        title: { display: true, text: 'A' },
+        grid: { drawOnChartArea: false },
+      },
+    },
+  };
 
   constructor() {
     setInterval(() => this.poll.update((value) => value + 1), POLL_INTERVAL_MS);
   }
+}
 
-  private waveformData(
-    peaks: number[] | undefined,
-    phasesDeg: number[] | undefined,
-    label: string,
-    color: string,
-  ): ChartData<'line', number[]> {
-    const harmonics = this.harmonics();
-    if (!peaks || !phasesDeg || !harmonics) {
-      return { labels: [], datasets: [] };
-    }
-
-    const { timesMs, ideal, real } = synthesizeWaveform(peaks, phasesDeg, harmonics.frequency_hz, harmonics.window_ms);
-    return {
-      labels: timesMs.map((t) => t.toFixed(1)),
-      datasets: [
-        {
-          label: `${label} (ideal)`,
-          data: ideal,
-          borderColor: '#9ca3af',
-          borderDash: [4, 4],
-          borderWidth: 3,
-          pointRadius: 0,
-          tension: 0,
-          fill: false,
-        },
-        {
-          label: `${label} (real)`,
-          data: real,
-          borderColor: color,
-          borderWidth: 5,
-          pointRadius: 0,
-          tension: 0,
-          fill: false,
-        },
-      ],
-    };
-  }
-
-  private axisOptions(unit: string): ChartOptions<'line'> {
-    return {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: { legend: { display: true, labels: { boxWidth: 12 } } },
-      scales: {
-        x: {
-          grid: { display: false },
-          title: { display: true, text: 'ms' },
-          ticks: { maxTicksLimit: 8, maxRotation: 0 },
-        },
-        y: {
-          title: { display: true, text: unit },
-        },
-      },
-    };
-  }
+function line(label: string, data: number[], color: string, axis: 'y' | 'y1', ideal: boolean) {
+  return {
+    label,
+    data,
+    borderColor: color,
+    borderDash: ideal ? [4, 4] : undefined,
+    borderWidth: ideal ? 3 : 5,
+    pointRadius: 0,
+    tension: 0,
+    fill: false,
+    yAxisID: axis,
+  };
 }

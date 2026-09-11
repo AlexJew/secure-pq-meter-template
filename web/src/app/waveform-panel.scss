@@ -26,20 +26,8 @@ header h2 {
   color: #6b7280;
 }
 
-.charts {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-  gap: 1rem;
-
-  @media (max-width: 720px) {
-    flex-direction: column;
-  }
-}
-
 .chart {
   position: relative;
   flex: 1;
   min-height: 0;
-  min-width: 0;
 }

@@ -7,12 +7,7 @@
   } @else {
     <p class="subtitle">Waiting for the first measurement…</p>
   }
-  <div class="charts">
-    <div class="chart">
-      <canvas baseChart [data]="voltageData()" [options]="voltageOptions" [type]="'line'"></canvas>
-    </div>
-    <div class="chart">
-      <canvas baseChart [data]="currentData()" [options]="currentOptions" [type]="'line'"></canvas>
-    </div>
+  <div class="chart">
+    <canvas baseChart [data]="data()" [options]="options" [type]="'line'"></canvas>
   </div>
 </section>
