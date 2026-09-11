@@ -30,3 +30,8 @@ target
 # pq-meter-client's local replay buffer (WAL mode also leaves -shm/-wal
 # siblings) wherever it's run from the repo root, e.g. scripts/run-dummy.sh.
 pqmeter.db*
+data.json
+
+# Angular (web/)
+web/node_modules
+web/dist
