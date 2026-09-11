@@ -1,0 +1,18 @@
+<section class="panel">
+  <header>
+    <h2>Waveform · ideal vs. real (from harmonic spectrum)</h2>
+  </header>
+  @if (harmonics(); as h) {
+    <p class="subtitle">{{ h.frequency_hz }} Hz fundamental, {{ h.harmonic_count }} harmonics, {{ h.window_ms }} ms window</p>
+  } @else {
+    <p class="subtitle">Waiting for the first measurement…</p>
+  }
+  <div class="charts">
+    <div class="chart">
+      <canvas baseChart [data]="voltageData()" [options]="voltageOptions" [type]="'line'"></canvas>
+    </div>
+    <div class="chart">
+      <canvas baseChart [data]="currentData()" [options]="currentOptions" [type]="'line'"></canvas>
+    </div>
+  </div>
+</section>

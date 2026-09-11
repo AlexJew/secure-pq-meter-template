@@ -10,8 +10,13 @@
 mod api;
 mod network;
 mod storage;
+mod web_api;
 
-use std::{net::IpAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use anyhow::Context;
 use clap::Parser;
@@ -19,6 +24,8 @@ use pocketscion::util::dev_auth_token;
 use sciparse::address::ip_socket_addr::ScionSocketIpAddr;
 use scion_quic::socket::GenericScionUdpSocket;
 use scion_stack::stack::ScionStackBuilder;
+use serde_json::Value;
+use storage::ServerStore;
 
 /// Command line arguments.
 #[derive(Debug, Parser)]
@@ -73,6 +80,29 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("creating the database directory {}", parent.display()))?;
     }
 
+    // Shared by the CONNECT tunnel (`api::serve`) and the dashboard's
+    // plain-HTTP API (`web_api::serve`): a reading pulled from a gateway
+    // becomes visible to the dashboard as soon as it's committed here.
+    let store = ServerStore::open(&args.db)
+        .with_context(|| format!("opening the database at {}", args.db.display()))?;
+    let store = Arc::new(Mutex::new(store));
+    // The most recent raw measurement received over the tunnel, for
+    // `GET /edh/v1/harmonics` — see `api::record_data` and
+    // `web_api::derive_harmonics`.
+    let latest: Arc<RwLock<Option<Value>>> = Arc::new(RwLock::new(None));
+
+    // Loopback-only and independent of `--bind-ip`: the dashboard always
+    // runs on this same machine, unlike the SCION interfaces below which may
+    // need to be reachable from the gateway.
+    let web_api_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), network::WEB_API_PORT);
+    let web_api_store = store.clone();
+    let web_api_latest = latest.clone();
+    tokio::spawn(async move {
+        if let Err(err) = web_api::serve(web_api_addr, web_api_store, web_api_latest).await {
+            eprintln!("dashboard web API stopped: {err}");
+        }
+    });
+
     let network = network::start(args.bind_ip).await?;
 
     // Attach a SCION stack to the server's AS and open a socket on it. The SNAP assigns the
@@ -101,6 +131,8 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("  accepting POST on:   {}", args.path);
     println!("  database:            {}", args.db.display());
+    println!("  dashboard web API:   http://{web_api_addr}{}", web_api::READINGS_PATH);
+    println!("                       http://{web_api_addr}{}", web_api::HARMONICS_PATH);
     println!();
     println!("Start the client with:");
     // The address is quoted because a shell would otherwise read the square brackets as a
@@ -114,7 +146,8 @@ async fn main() -> anyhow::Result<()> {
     api::serve(
         Arc::new(socket) as Arc<dyn GenericScionUdpSocket>,
         &args.path,
-        &args.db,
+        store,
+        latest,
     )
     .await
 }

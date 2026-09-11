@@ -53,6 +53,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
+use serde_json::{Value, json};
 
 /// Largest number of distinct value columns `readings` is allowed to grow to.
 /// Reading names come off the network; without a cap, a misbehaving or
@@ -205,6 +206,45 @@ impl ServerStore {
         value_column_names(&self.conn)
     }
 
+    /// Returns up to `limit` readings with `id` greater than `after_id`
+    /// (optionally restricted to one `gateway`), answered oldest first so a
+    /// caller can plot them left-to-right without re-sorting. When more than
+    /// `limit` rows qualify, the *newest* ones are the ones kept — this
+    /// trades completeness for a bounded response, since (unlike the
+    /// tunnel's own pull loop, which never drops a row) a REST poller can
+    /// just ask again with a later `after_id`.
+    ///
+    /// Each row is a JSON object keyed like the wire protocol
+    /// (`meter::MeterSnapshot::to_json` in `pq-meter-client`): `id`, `index`
+    /// (this row's `idx`), `gateway`, `timestamp` (`ts_millis` as a string,
+    /// matching how the client sends it), and one field per value column
+    /// that isn't `NULL` for this row — a column another gateway added (or
+    /// simply not reported by this reading, see the module doc comment) is
+    /// omitted rather than sent as `null`.
+    pub fn readings(&self, gateway: Option<&str>, after_id: i64, limit: usize) -> Result<Vec<Value>> {
+        let mut columns = vec!["id".to_string(), "gateway".to_string(), "idx".to_string(), "ts_millis".to_string()];
+        columns.extend(value_column_names(&self.conn)?);
+        let column_list = columns.join(", ");
+        let limit = limit as i64;
+
+        let mut rows = if let Some(gateway) = gateway {
+            let sql = format!(
+                "SELECT {column_list} FROM readings WHERE id > ?1 AND gateway = ?2 ORDER BY id DESC LIMIT ?3"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            stmt.query_map(rusqlite::params![after_id, gateway, limit], |row| row_to_json(row, &columns))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let sql =
+                format!("SELECT {column_list} FROM readings WHERE id > ?1 ORDER BY id DESC LIMIT ?2");
+            let mut stmt = self.conn.prepare(&sql)?;
+            stmt.query_map(rusqlite::params![after_id, limit], |row| row_to_json(row, &columns))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Moves committed WAL frames into the base file, without blocking a
     /// concurrent reader or writer (it simply checkpoints as much as it can
     /// without waiting for one to finish). See the module doc comment for why
@@ -263,6 +303,26 @@ fn value_column_names(conn: &Connection) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<_>>()?;
     names.retain(|name| !RESERVED_COLUMN_NAMES.contains(&name.as_str()));
     Ok(names)
+}
+
+/// Turns one `readings` row into a JSON object, using the wire protocol's
+/// field names rather than the raw SQL column names — see
+/// [`ServerStore::readings`].
+fn row_to_json(row: &rusqlite::Row, columns: &[String]) -> rusqlite::Result<Value> {
+    let mut object = serde_json::Map::with_capacity(columns.len());
+    for (i, name) in columns.iter().enumerate() {
+        match name.as_str() {
+            "id" => object.insert("id".to_string(), json!(row.get::<_, i64>(i)?)),
+            "idx" => object.insert("index".to_string(), json!(row.get::<_, i64>(i)?)),
+            "gateway" => object.insert("gateway".to_string(), json!(row.get::<_, String>(i)?)),
+            "ts_millis" => object.insert("timestamp".to_string(), json!(row.get::<_, i64>(i)?.to_string())),
+            value_name => {
+                let value: Option<f64> = row.get(i)?;
+                value.and_then(|value| object.insert(value_name.to_string(), json!(value)))
+            }
+        };
+    }
+    Ok(Value::Object(object))
 }
 
 /// Whether `name` can be used as a `readings` value column name. Reading
@@ -478,6 +538,77 @@ mod tests {
             .record_batch("pi-north", 1, &[Row { idx: 1, ts_millis: 100, values }])
             .unwrap_err();
         assert!(err.to_string().contains("readings already has"));
+    }
+
+    #[test]
+    fn readings_are_answered_oldest_first_with_wire_protocol_field_names() {
+        let mut store = ServerStore::open_in_memory().unwrap();
+        store.record_batch("pi-north", 2, &[row(1, 100), row(2, 200)]).unwrap();
+
+        let readings = store.readings(None, 0, 10).unwrap();
+
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0]["index"], json!(1));
+        assert_eq!(readings[0]["timestamp"], json!("100"));
+        assert_eq!(readings[0]["gateway"], json!("pi-north"));
+        assert_eq!(readings[0]["voltage_l1_v"], json!(230.1));
+        assert_eq!(readings[1]["index"], json!(2));
+    }
+
+    #[test]
+    fn readings_since_id_only_returns_newer_rows() {
+        let mut store = ServerStore::open_in_memory().unwrap();
+        store.record_batch("pi-north", 3, &[row(1, 100), row(2, 200), row(3, 300)]).unwrap();
+
+        let readings = store.readings(None, 1, 10).unwrap();
+
+        let indices: Vec<i64> = readings.iter().map(|r| r["index"].as_i64().unwrap()).collect();
+        assert_eq!(indices, vec![2, 3]);
+    }
+
+    #[test]
+    fn readings_limit_keeps_the_newest_rows_but_still_answers_oldest_first() {
+        let mut store = ServerStore::open_in_memory().unwrap();
+        store.record_batch("pi-north", 3, &[row(1, 100), row(2, 200), row(3, 300)]).unwrap();
+
+        let readings = store.readings(None, 0, 2).unwrap();
+
+        let indices: Vec<i64> = readings.iter().map(|r| r["index"].as_i64().unwrap()).collect();
+        assert_eq!(indices, vec![2, 3]);
+    }
+
+    #[test]
+    fn readings_gateway_filter_excludes_other_gateways() {
+        let mut store = ServerStore::open_in_memory().unwrap();
+        store.record_batch("pi-north", 1, &[row(1, 100)]).unwrap();
+        store.record_batch("pi-south", 9, &[row(9, 900)]).unwrap();
+
+        let readings = store.readings(Some("pi-north"), 0, 10).unwrap();
+
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0]["gateway"], json!("pi-north"));
+    }
+
+    #[test]
+    fn readings_omit_a_value_column_the_row_does_not_have() {
+        let mut store = ServerStore::open_in_memory().unwrap();
+        store.record_batch("pi-north", 1, &[row(1, 100)]).unwrap();
+        store
+            .record_batch(
+                "pi-north",
+                2,
+                &[Row {
+                    idx: 2,
+                    ts_millis: 200,
+                    values: vec![("frequency_hz".to_string(), 50.0)],
+                }],
+            )
+            .unwrap();
+
+        let readings = store.readings(None, 0, 10).unwrap();
+
+        assert!(readings[0].get("frequency_hz").is_none());
+        assert!(readings[1].get("voltage_l1_v").is_none());
     }
 
     #[test]

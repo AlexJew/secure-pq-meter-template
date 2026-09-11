@@ -50,6 +50,11 @@ const GATEWAY_SNAP_DATA_PLANE_PORT: u16 = 31011;
 const SERVER_SNAP_CONTROL_PORT: u16 = 31020;
 /// Port of the SNAP data plane in [`SERVER_AS`].
 const SERVER_SNAP_DATA_PLANE_PORT: u16 = 31021;
+/// Port of the dashboard's plain-HTTP data API (`web_api::serve`). Not a
+/// PocketSCION interface like the ports above — it's a plain `TcpListener`
+/// on loopback that the Angular dev proxy (`web/proxy.conf.json`) forwards
+/// `/edh/v1/*` to.
+pub const WEB_API_PORT: u16 = 31030;
 
 /// A running simulated SCION network.
 pub struct Network {

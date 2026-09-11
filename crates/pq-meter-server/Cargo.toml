@@ -24,7 +24,7 @@ scion-sdk-utils = { workspace = true }
 scion-stack = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }

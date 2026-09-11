@@ -31,9 +31,8 @@
 //! `payload.latest_index` is for.
 
 use std::{
-    path::Path,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -94,22 +93,22 @@ pub const PULL_INTERVAL: Duration = Duration::from_secs(5);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Serves the HTTP/3 application on `socket` until the process is stopped.
+///
+/// `store` and `latest` are shared with `web_api::serve` (all three are
+/// handed the same `Arc`s, created once in `main.rs`), so a reading pulled
+/// from a gateway here is immediately visible to the dashboard's plain-HTTP
+/// API — `store` for `GET /edh/v1/readings`, `latest` (the most recent raw
+/// measurement, see [`record_data`]) for `GET /edh/v1/harmonics`.
 pub async fn serve(
     socket: Arc<dyn GenericScionUdpSocket>,
     path: &str,
-    db_path: &Path,
+    store: Arc<Mutex<ServerStore>>,
+    latest: Arc<RwLock<Option<Value>>>,
 ) -> anyhow::Result<()> {
     let app = Router::new().route(path, post(receive));
     let config = quic_config().context("building the QUIC server configuration")?;
-    // One connection shared by every tunnel session (past and future gateways
-    // alike): opening a fresh `Connection` per `CONNECT` let concurrent
-    // reconnects race each other initializing the same WAL-mode file, which
-    // surfaced as spurious "disk I/O error"s under rapid reconnects.
-    let store = ServerStore::open(db_path)
-        .with_context(|| format!("opening the database at {}", db_path.display()))?;
-    let store = Arc::new(Mutex::new(store));
     tokio::spawn(checkpoint_periodically(store.clone()));
-    let service = MeterService { app, store };
+    let service = MeterService { app, store, latest };
 
     let metrics = Metrics::new_without_registry();
     let endpoint =
@@ -141,6 +140,7 @@ async fn receive(body: String) -> (StatusCode, &'static str) {
 struct MeterService {
     app: Router,
     store: Arc<Mutex<ServerStore>>,
+    latest: Arc<RwLock<Option<Value>>>,
 }
 
 impl HttpService for MeterService {
@@ -149,7 +149,7 @@ impl HttpService for MeterService {
 
     async fn call(&self, req: http::Request<H3RequestBody>) -> http::Response<ResponseBody> {
         if req.method() == http::Method::CONNECT {
-            return connect_tunnel(req, self.store.clone());
+            return connect_tunnel(req, self.store.clone(), self.latest.clone());
         }
 
         let response: http::Response<AxumBody> = self
@@ -171,7 +171,11 @@ impl HttpService for MeterService {
 /// Opens a bidirectional data tunnel for a `CONNECT` request: answers with
 /// `200`, then serves the tunnel with a background task while the response
 /// body streams the server's data requests out to the gateway.
-fn connect_tunnel(req: http::Request<H3RequestBody>, store: Arc<Mutex<ServerStore>>) -> http::Response<ResponseBody> {
+fn connect_tunnel(
+    req: http::Request<H3RequestBody>,
+    store: Arc<Mutex<ServerStore>>,
+    latest: Arc<RwLock<Option<Value>>>,
+) -> http::Response<ResponseBody> {
     let gateway = req
         .headers()
         .get(GATEWAY_ID_HEADER)
@@ -189,7 +193,7 @@ fn connect_tunnel(req: http::Request<H3RequestBody>, store: Arc<Mutex<ServerStor
 
     let (_parts, body) = req.into_parts();
     let (out, rx) = unbounded_channel();
-    tokio::spawn(tunnel_session(body, out, store, gateway));
+    tokio::spawn(tunnel_session(body, out, store, gateway, latest));
 
     let mut response = http::Response::new(ResponseBody::Tunnel(rx));
     *response.status_mut() = StatusCode::OK;
@@ -206,6 +210,7 @@ async fn tunnel_session(
     out: UnboundedSender<Bytes>,
     store: Arc<Mutex<ServerStore>>,
     gateway: String,
+    latest: Arc<RwLock<Option<Value>>>,
 ) {
     // The index the gateway has sent data up to so far; the next pull asks
     // for everything since it (0 = from the beginning). Resumed from this
@@ -253,7 +258,7 @@ async fn tunnel_session(
                 };
                 pending.extend_from_slice(&data);
                 while let Some(line) = next_line(&mut pending) {
-                    record_data(&line, &gateway, &mut last_index, &store);
+                    record_data(&line, &gateway, &mut last_index, &store, &latest);
                     awaiting_reply = false;
                 }
             }
@@ -295,7 +300,18 @@ fn send_pull_request(out: &UnboundedSender<Bytes>, id: u64, from: u64) -> bool {
 /// or resets it to `0` if the gateway's own reported high-water mark
 /// (`payload.latest_index`) shows its history has shrunk since the request
 /// this reply answers — see [`needs_reset`] and `CONNECT_PROTOCOL.md`.
-fn record_data(line: &[u8], gateway: &str, last_index: &mut u64, store: &Mutex<ServerStore>) {
+///
+/// Also mirrors the batch's last (i.e. newest) raw measurement object into
+/// `latest`, regardless of whether storing the batch below succeeds — it's a
+/// live snapshot for `web_api::harmonics`, not part of the durable history,
+/// so a storage hiccup shouldn't hold it back.
+fn record_data(
+    line: &[u8],
+    gateway: &str,
+    last_index: &mut u64,
+    store: &Mutex<ServerStore>,
+    latest: &RwLock<Option<Value>>,
+) {
     let message: Value = match serde_json::from_slice(line) {
         Ok(message) => message,
         Err(err) => {
@@ -311,6 +327,10 @@ fn record_data(line: &[u8], gateway: &str, last_index: &mut u64, store: &Mutex<S
         return;
     };
     let latest_index = message.pointer("/payload/latest_index").and_then(Value::as_u64);
+
+    if let Some(last) = data.last() {
+        *latest.write().unwrap() = Some(last.clone());
+    }
 
     let mut rows = Vec::with_capacity(data.len());
     let mut new_last_index = *last_index;

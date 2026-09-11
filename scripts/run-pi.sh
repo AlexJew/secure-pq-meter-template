@@ -3,8 +3,12 @@
 # this laptop, cross compiles pq-meter-client for the Pi, copies it over, and
 # starts it there against the real meter (or a dummy one, with --dummy-meter).
 #
-#   scripts/run-pi.sh                 # real meter, values from CLAUDE.md
-#   scripts/run-pi.sh --dummy-meter   # skip the meter, use plausible fake data
+#   scripts/run-pi.sh                        # real meter, values from CLAUDE.md
+#   scripts/run-pi.sh --dummy-meter          # skip the meter, use plausible fake data
+#   scripts/run-pi.sh --web                  # the above, plus the Angular dashboard
+#   scripts/run-pi.sh --dummy-meter --web    # (`web/`) at http://localhost:4200, reading
+#                                             # live data through its dev proxy. Installs
+#                                             # `web/node_modules` first if missing.
 #
 # Override any of these via the environment if your setup differs from
 # CLAUDE.md's:
@@ -24,14 +28,17 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 dummy_meter=0
-case "${1:-}" in
-"") ;;
---dummy-meter) dummy_meter=1 ;;
-*)
-  echo "usage: $0 [--dummy-meter]" >&2
-  exit 2
-  ;;
-esac
+web=0
+for arg in "$@"; do
+  case "$arg" in
+  --dummy-meter) dummy_meter=1 ;;
+  --web) web=1 ;;
+  *)
+    echo "usage: $0 [--dummy-meter] [--web]" >&2
+    exit 2
+    ;;
+  esac
+done
 
 PI_HOST=${PI_HOST:-10.175.8.132}
 PI_USER=${PI_USER:-anapaya}
@@ -67,13 +74,16 @@ cargo cross build --release -p pq-meter-client --target aarch64-unknown-linux-gn
 # restart instead of resuming from the cursor as designed.
 
 log=$(mktemp "${TMPDIR:-/tmp}/pq-meter-server.XXXXXX")
+web_log=""
 control_path=$(mktemp -u "${TMPDIR:-/tmp}/pq-meter-ssh.XXXXXX")
 server_pid=""
 tail_pid=""
+web_pid=""
+web_tail_pid=""
 client_pid=""
 
 cleanup() {
-  for pid in "$client_pid" "$server_pid" "$tail_pid"; do
+  for pid in "$client_pid" "$server_pid" "$web_pid" "$tail_pid" "$web_tail_pid"; do
     if [ -n "$pid" ]; then
       kill "$pid" >/dev/null 2>&1 || true
       wait "$pid" 2>/dev/null || true
@@ -83,7 +93,7 @@ cleanup() {
   # client running under it) even if killing the local ssh process above
   # somehow didn't.
   ssh -o ControlPath="$control_path" -O exit "$PI_USER@$PI_HOST" >/dev/null 2>&1 || true
-  rm -f "$log"
+  rm -f "$log" "$web_log"
 }
 trap cleanup EXIT INT TERM
 
@@ -125,6 +135,21 @@ echo "    endhost API: $endhost_api"
 echo "    server:      $server_addr"
 echo
 
+if [ "$web" -eq 1 ]; then
+  if [ ! -d "$repo_root/web/node_modules" ]; then
+    echo "==> installing web frontend dependencies (first run only)"
+    (cd "$repo_root/web" && npm install)
+  fi
+
+  # `ng serve`'s dev proxy (web/proxy.conf.json) forwards /edh/v1/* to the
+  # server's plain-HTTP data API on the fixed port web_api::WEB_API_PORT
+  # (31030) -- unlike server_addr above, nothing here needs to be scraped.
+  web_log=$(mktemp "${TMPDIR:-/tmp}/pq-meter-web.XXXXXX")
+  echo "==> starting the web frontend (ng serve, log: $web_log)"
+  (cd "$repo_root/web" && npm start) >"$web_log" 2>&1 &
+  web_pid=$!
+fi
+
 echo "==> opening an ssh connection to $PI_USER@$PI_HOST (password prompt below happens once)"
 ssh -o ControlMaster=auto -o ControlPath="$control_path" -o ControlPersist=10m \
   -fN "$PI_USER@$PI_HOST"
@@ -156,13 +181,22 @@ echo "    NOTE: the client's own tracing lines (timestamped, INFO/WARN) are"
 echo "          interleaved with the server's plain 'data: ...' /"
 echo "          'received N measurement(s)...' lines, tailed live from $log."
 echo "          Readings land in data/pqmeter.db; 'docker compose up -d' in a"
-echo "          separate terminal serves a live dashboard of them at"
+echo "          separate terminal serves a Grafana dashboard of them at"
 echo "          http://localhost:3000."
-echo "    Press Ctrl-C to stop the server and the remote client."
+if [ "$web" -eq 1 ]; then
+  echo "          The Angular dashboard is compiling at http://localhost:4200 --"
+  echo "          give it a few seconds, its own log is tailed live from $web_log."
+fi
+echo "    Press Ctrl-C to stop the server, the remote client, and everything else"
+echo "    started above."
 echo
 
 tail -n 0 -f "$log" &
 tail_pid=$!
+if [ "$web" -eq 1 ]; then
+  tail -n 0 -f "$web_log" &
+  web_tail_pid=$!
+fi
 
 # Backgrounded and `wait`-ed, not run in the foreground: see
 # scripts/run-dummy.sh's comment on why that's what lets Ctrl-C's trap fire

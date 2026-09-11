@@ -138,10 +138,13 @@ plausible, slowly drifting readings with no hardware attached. `scripts/run-dumm
 this:
 
 ```bash
-scripts/run-dummy.sh          # hermetic: builds, then runs the client's tests, printing
-                               # a real dummy "data" reply. No server or network needed.
-scripts/run-dummy.sh --live   # starts pq-meter-server, scrapes its address, and points
-                               # the client at it (see the CONNECT note above).
+scripts/run-dummy.sh                # hermetic: builds, then runs the client's tests, printing
+                                     # a real dummy "data" reply. No server or network needed.
+scripts/run-dummy.sh --live         # starts pq-meter-server, scrapes its address, and points
+                                     # the client at it (see the CONNECT note above).
+scripts/run-dummy.sh --live --web   # the above, plus the Angular dashboard (`web/`) at
+                                     # http://localhost:4200, reading live data through its
+                                     # dev proxy (installs `web/node_modules` first if missing).
 ```
 
 See `crates/pq-meter-client/METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`,
@@ -204,10 +207,12 @@ automatically within its `updateIntervalSeconds` (10s), no restart needed.
 
 `scripts/run-pi.sh` automates everything below in one command: it starts the server, cross
 compiles the client, copies it to the Pi over `scp`, and starts it there (`--dummy-meter`
-instead of the real meter with `scripts/run-pi.sh --dummy-meter`). It asks for the Pi's ssh
-password once and reuses that connection for the rest. See the script's own header comment
-for the environment variables it reads (Pi address, meter address, credentials) if your setup
-differs from the defaults in `CLAUDE.md`.
+instead of the real meter with `scripts/run-pi.sh --dummy-meter`). Add `--web` to also start
+the Angular dashboard (`web/`) at http://localhost:4200, reading live data through its dev
+proxy — same as `scripts/run-dummy.sh --live --web`, just against the real meter's data. It
+asks for the Pi's ssh password once and reuses that connection for the rest. See the script's
+own header comment for the environment variables it reads (Pi address, meter address,
+credentials) if your setup differs from the defaults in `CLAUDE.md`.
 
 The manual steps it automates:
 
