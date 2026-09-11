@@ -21,4 +21,9 @@ target
 #.idea/
 
 # Data files
-data.json
+# pq-meter-server's durable SQLite store (see crates/pq-meter-server/TODO.md);
+# data.json is gone, replaced by this.
+/data/
+# pq-meter-client's local replay buffer (WAL mode also leaves -shm/-wal
+# siblings) wherever it's run from the repo root, e.g. scripts/run-dummy.sh.
+pqmeter.db*

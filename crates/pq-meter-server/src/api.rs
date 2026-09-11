@@ -6,7 +6,7 @@
 //!   meter data from the gateway: every few seconds it sends a `data` request
 //!   naming the last index it received, and the gateway answers with all
 //!   measurements since that index. Each received measurement is printed on
-//!   stdout and stored in the local data file.
+//!   stdout and stored in the server's SQLite database (see [`storage`]).
 //! * Everything else is served by a plain [`axum::Router`], so the
 //!   `POST /edh/v1/hello` endpoint of the original template keeps working and
 //!   you can add more routes the usual way.
@@ -21,12 +21,16 @@
 //! now", and the gateway answers with
 //!
 //! ```json
-//! {"type": "data", "id": 42, "payload": {"data": [{"timestamp": "...", "value1": 1.0, "value2": 2.0, "index": 1}]}}
+//! {"type": "data", "id": 42, "payload": {"latest_index": 1, "data": [{"timestamp": "...", "value1": 1.0, "value2": 2.0, "index": 1}]}}
 //! ```
+//!
+//! The `CONNECT` request itself carries an `x-pq-gateway-id` header
+//! identifying the gateway; see `CONNECT_PROTOCOL.md`'s "Gateway Identity and
+//! History Resets" section for why (multiple gateways need a stable identity
+//! to key persisted history and a pull cursor on) and for what
+//! `payload.latest_index` is for.
 
 use std::{
-    fs::{File, OpenOptions},
-    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -62,6 +66,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
+use crate::storage::{Row, ServerStore, needs_reset};
+
+/// Header carrying a gateway's stable identity on the CONNECT request, see
+/// the module doc comment.
+const GATEWAY_ID_HEADER: &str = "x-pq-gateway-id";
+
+/// Identity used for a tunnel that did not send [`GATEWAY_ID_HEADER`] (an
+/// older client, or a header that failed to decode as UTF-8).
+const UNKNOWN_GATEWAY: &str = "unknown";
+
 /// Path the server accepts POST requests on.
 pub const DEFAULT_PATH: &str = "/edh/v1/hello";
 
@@ -76,13 +90,13 @@ pub const PULL_INTERVAL: Duration = Duration::from_secs(5);
 pub async fn serve(
     socket: Arc<dyn GenericScionUdpSocket>,
     path: &str,
-    data_file: &Path,
+    db_path: &Path,
 ) -> anyhow::Result<()> {
     let app = Router::new().route(path, post(receive));
     let config = quic_config().context("building the QUIC server configuration")?;
     let service = MeterService {
         app,
-        data_file: data_file.to_path_buf(),
+        db_path: db_path.to_path_buf(),
     };
 
     let metrics = Metrics::new_without_registry();
@@ -114,7 +128,7 @@ async fn receive(body: String) -> (StatusCode, &'static str) {
 /// the axum router.
 struct MeterService {
     app: Router,
-    data_file: PathBuf,
+    db_path: PathBuf,
 }
 
 impl HttpService for MeterService {
@@ -123,7 +137,7 @@ impl HttpService for MeterService {
 
     async fn call(&self, req: http::Request<H3RequestBody>) -> http::Response<ResponseBody> {
         if req.method() == http::Method::CONNECT {
-            return connect_tunnel(req, &self.data_file);
+            return connect_tunnel(req, &self.db_path);
         }
 
         let response: http::Response<AxumBody> = self
@@ -145,13 +159,25 @@ impl HttpService for MeterService {
 /// Opens a bidirectional data tunnel for a `CONNECT` request: answers with
 /// `200`, then serves the tunnel with a background task while the response
 /// body streams the server's data requests out to the gateway.
-fn connect_tunnel(req: http::Request<H3RequestBody>, data_file: &PathBuf) -> http::Response<ResponseBody> {
-    let authority = req.uri().authority().map(ToString::to_string);
-    println!("data tunnel opened by {authority:?}");
+fn connect_tunnel(req: http::Request<H3RequestBody>, db_path: &PathBuf) -> http::Response<ResponseBody> {
+    let gateway = req
+        .headers()
+        .get(GATEWAY_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(UNKNOWN_GATEWAY)
+        .to_string();
+    if gateway == UNKNOWN_GATEWAY {
+        tracing::warn!(
+            "data tunnel opened with no {GATEWAY_ID_HEADER} header; its history will be \
+             attributed to {UNKNOWN_GATEWAY:?} and may mix with another such gateway"
+        );
+    }
+    println!("data tunnel opened by gateway {gateway:?}");
 
     let (_parts, body) = req.into_parts();
     let (out, rx) = unbounded_channel();
-    tokio::spawn(tunnel_session(body, out, data_file.clone()));
+    tokio::spawn(tunnel_session(body, out, db_path.clone(), gateway));
 
     let mut response = http::Response::new(ResponseBody::Tunnel(rx));
     *response.status_mut() = StatusCode::OK;
@@ -163,25 +189,30 @@ fn connect_tunnel(req: http::Request<H3RequestBody>, data_file: &PathBuf) -> htt
 ///
 /// The session ends when the gateway closes the tunnel, when the connection
 /// drops, or when the response side is gone.
-async fn tunnel_session(mut body: H3RequestBody, out: UnboundedSender<Bytes>, data_file: PathBuf) {
-    let mut file = match OpenOptions::new().create(true).append(true).open(&data_file) {
-        Ok(file) => file,
+async fn tunnel_session(mut body: H3RequestBody, out: UnboundedSender<Bytes>, db_path: PathBuf, gateway: String) {
+    let mut store = match ServerStore::open(&db_path) {
+        Ok(store) => store,
         Err(err) => {
-            eprintln!("could not open {data_file:?} for writing: {err}");
+            eprintln!("could not open {db_path:?}: {err}");
             return;
         }
     };
 
     // The index the gateway has sent data up to so far; the next pull asks
-    // for everything since it (0 = from the beginning).
-    let mut last_index: u64 = 0;
+    // for everything since it (0 = from the beginning). Resumed from this
+    // gateway's last stored cursor, so a reconnect does not re-pull (and
+    // double-count) its entire history from index 0 (TODO item 3).
+    let mut last_index: u64 = match store.cursor(&gateway) {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            eprintln!("could not read the stored cursor for {gateway:?}: {err}");
+            return;
+        }
+    };
     // Monotonic request id the gateway echoes back in its answers.
     let mut next_id: u64 = 1;
     // Bytes of the current gateway message not yet part of a full line.
     let mut pending = bytes::BytesMut::new();
-    // All measurements received over this tunnel; the data file is rewritten
-    // as a JSON array whenever a new batch arrives.
-    let mut measurements: Vec<Value> = Vec::new();
 
     let mut ticker = interval(PULL_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -205,9 +236,7 @@ async fn tunnel_session(mut body: H3RequestBody, out: UnboundedSender<Bytes>, da
                 };
                 pending.extend_from_slice(&data);
                 while let Some(line) = next_line(&mut pending) {
-                    if let Some(count) = record_data(&line, &mut last_index, &mut measurements, &mut file) {
-                        println!("received {count} measurement(s) from the gateway");
-                    }
+                    record_data(&line, &gateway, &mut last_index, &mut store);
                 }
             }
         }
@@ -229,44 +258,109 @@ fn send_pull_request(out: &UnboundedSender<Bytes>, id: u64, from: u64) -> bool {
     out.send(Bytes::from(bytes)).is_ok()
 }
 
-/// Prints each measurement of a gateway data response to stdout and rewrites
-/// the data file as a JSON array of everything received so far. Returns the
-/// number of measurements recorded.
-fn record_data(
-    line: &[u8],
-    last_index: &mut u64,
-    measurements: &mut Vec<Value>,
-    file: &mut File,
-) -> Option<usize> {
-    let message: Value = serde_json::from_slice(line).ok()?;
-    if message.get("type").and_then(Value::as_str) != Some("data") {
-        return None;
-    }
-    let data = message.pointer("/payload/data")?.as_array()?;
-    for measurement in data {
-        if let Some(index) = measurement.get("index").and_then(Value::as_u64) {
-            *last_index = (*last_index).max(index);
+/// Parses one gateway data reply, prints each measurement, and stores the
+/// batch in `store`. Advances `last_index` to the highest index just stored,
+/// or resets it to `0` if the gateway's own reported high-water mark
+/// (`payload.latest_index`) shows its history has shrunk since the request
+/// this reply answers — see [`needs_reset`] and `CONNECT_PROTOCOL.md`.
+fn record_data(line: &[u8], gateway: &str, last_index: &mut u64, store: &mut ServerStore) {
+    let message: Value = match serde_json::from_slice(line) {
+        Ok(message) => message,
+        Err(err) => {
+            eprintln!("invalid JSON from gateway {gateway:?}, ignoring: {err}");
+            return;
         }
+    };
+    if message.get("type").and_then(Value::as_str) != Some("data") {
+        return;
+    }
+    let Some(data) = message.pointer("/payload/data").and_then(Value::as_array) else {
+        eprintln!("data reply from gateway {gateway:?} has no \"payload.data\" array, ignoring");
+        return;
+    };
+    let latest_index = message.pointer("/payload/latest_index").and_then(Value::as_u64);
+
+    let mut rows = Vec::with_capacity(data.len());
+    let mut new_last_index = *last_index;
+    for measurement in data {
         println!("data: {measurement}");
-        measurements.push(measurement.clone());
+        match measurement_to_row(measurement) {
+            Some(row) => {
+                new_last_index = new_last_index.max(row.idx);
+                rows.push(row);
+            }
+            None => eprintln!(
+                "measurement from gateway {gateway:?} is missing a numeric \"index\" or a \
+                 parseable \"timestamp\", skipping it: {measurement}"
+            ),
+        }
     }
 
-    let all = serde_json::to_string_pretty(measurements).expect("serializing the data file");
-    if let Err(err) = rewrite_file(file, &all) {
-        eprintln!("failed to update the data file: {err}");
+    match store.record_batch(gateway, new_last_index, &rows) {
+        Ok(recorded) => println!(
+            "received {} measurement(s) from gateway {gateway:?} ({} new, {} already stored)",
+            rows.len(),
+            recorded.inserted,
+            recorded.duplicates,
+        ),
+        Err(err) => {
+            // Leave last_index untouched: the transaction rolled back, so
+            // nothing was persisted, and the next pull should ask for this
+            // same range again rather than skip past it.
+            eprintln!("failed to store data from gateway {gateway:?}, will retry: {err}");
+            return;
+        }
     }
 
-    Some(data.len())
+    if needs_reset(*last_index, latest_index) {
+        println!(
+            "gateway {gateway:?} reports a smaller history than before (latest_index \
+             {latest_index:?} < cursor {last_index}); its local database was likely deleted and \
+             recreated — resetting its pull cursor to 0"
+        );
+        *last_index = 0;
+    } else {
+        *last_index = new_last_index;
+    }
 }
 
-/// Replaces the contents of `file` with `contents`.
-fn rewrite_file(file: &mut File, contents: &str) -> std::io::Result<()> {
-    use std::io::Seek;
+/// Builds one [`Row`] from a measurement object, or `None` if it lacks a
+/// numeric `"index"` or a parseable `"timestamp"`. Every other numeric field
+/// becomes a value; `"id"` (the client's own row id, redundant with
+/// `"index"`) is skipped, and a field whose name cannot be a SQL column name
+/// is dropped with a warning rather than losing the whole measurement to it.
+fn measurement_to_row(measurement: &Value) -> Option<Row> {
+    let idx = measurement.get("index").and_then(Value::as_u64)?;
+    let ts_millis = parse_ts_millis(measurement.get("timestamp"))?;
 
-    file.set_len(0)?;
-    file.rewind()?;
-    file.write_all(contents.as_bytes())?;
-    file.flush()
+    let values = measurement
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| !matches!(name.as_str(), "index" | "timestamp" | "id"))
+        .filter_map(|(name, value)| {
+            let value = value.as_f64()?;
+            if crate::storage::is_valid_value_name(name) {
+                Some((name.clone(), value))
+            } else {
+                eprintln!("measurement {idx} has an unusable field name {name:?}, dropping it");
+                None
+            }
+        })
+        .collect();
+
+    Some(Row { idx, ts_millis, values })
+}
+
+/// Parses a `"timestamp"` field as milliseconds since the Unix epoch. The
+/// client sends it as a string (see `pq-meter-client`'s
+/// `stored_reading_json`), but a bare JSON number is accepted too.
+fn parse_ts_millis(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        _ => None,
+    }
 }
 
 /// Splits one newline-terminated message off the front of `pending`, if the

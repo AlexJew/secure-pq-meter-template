@@ -1,0 +1,40 @@
+# Runs Grafana as a container reading crates/pq-meter-server's SQLite file
+# directly (see crates/pq-meter-server/TODO.md's "Grafana" section) — no
+# /metrics endpoint or separate time-series database needed for the demo.
+#
+# Usage:
+#   docker compose up -d
+#   open http://localhost:3000   (no login: anonymous Viewer access, local demo only)
+#
+# The dashboard and datasource are provisioned from ./grafana, so there is
+# nothing to click through — start the server and client (or
+# scripts/run-dummy.sh --live) and readings should appear within a few
+# seconds of the first pull.
+services:
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    restart: unless-stopped
+    environment:
+      # frser-sqlite-datasource is a community plugin, not bundled with
+      # Grafana; this downloads and installs it in the background while the
+      # server starts (see docs/installation.md in that plugin's repo).
+      - GF_PLUGINS_PREINSTALL=frser-sqlite-datasource@4.0.6
+      # Local demo convenience: skip the login screen. Do not do this outside
+      # a machine you control.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    ports:
+      - '3000:3000'
+    volumes:
+      - grafana_storage:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Read-write, and a directory rather than a single bind-mounted file:
+      # the server opens its database in WAL mode, and a WAL *reader* (this
+      # container) still has to create/update the "-shm" file next to it, so
+      # a read-only mount breaks reads outright, and bind-mounting only the
+      # ".db" file breaks the moment SQLite replaces that inode.
+      - ./data:/data
+
+volumes:
+  grafana_storage: {}

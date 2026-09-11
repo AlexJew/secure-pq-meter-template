@@ -29,6 +29,18 @@ case "$mode" in
   echo "==> building pq-meter-server and pq-meter-client"
   cargo build -p pq-meter-server -p pq-meter-client
 
+  # Both the client's and the server's SQLite files are transient/inspectable
+  # local state, not something a fresh demo run should replay. Left over from
+  # a previous run, the server's stored cursor for this gateway would be
+  # ahead of what the client's fresh history can ever reach again -- it
+  # self-heals (see CONNECT_PROTOCOL.md's "Gateway Identity and History
+  # Resets"), but only after detecting the mismatch on the first pull, so
+  # starting clean avoids the extra 5s delay and any confusion from stale
+  # rows briefly still being what a dashboard shows.
+  echo "==> removing any pqmeter.db/data/pqmeter.db left over from a previous run"
+  rm -f pqmeter.db pqmeter.db-shm pqmeter.db-wal
+  rm -f data/pqmeter.db data/pqmeter.db-shm data/pqmeter.db-wal
+
   log=$(mktemp "${TMPDIR:-/tmp}/pq-meter-server.XXXXXX")
   server_pid=""
   tail_pid=""
@@ -91,6 +103,9 @@ case "$mode" in
   echo "      Below, the client's own tracing lines (timestamped, INFO/WARN)"
   echo "      are interleaved with the server's plain 'data: ...' /"
   echo "      'received N measurement(s)...' lines, tailed live from $log."
+  echo "      Readings land in data/pqmeter.db; 'docker compose up -d' in a"
+  echo "      separate terminal serves a live dashboard of them at"
+  echo "      http://localhost:3000."
   echo "      Press Ctrl-C to stop both."
   echo
 

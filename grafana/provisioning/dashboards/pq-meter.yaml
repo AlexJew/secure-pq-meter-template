@@ -1,0 +1,15 @@
+# Loads dashboard JSON files from /var/lib/grafana/dashboards (bind-mounted
+# from ../../dashboards in docker-compose.yml) instead of requiring them to
+# be clicked together in the UI.
+apiVersion: 1
+
+providers:
+  - name: pq-meter
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -3153,6 +3153,7 @@ dependencies = [
  "http-body-util",
  "pocketscion",
  "rcgen",
+ "rusqlite",
  "scion-quic",
  "scion-sdk-utils",
  "scion-stack",
