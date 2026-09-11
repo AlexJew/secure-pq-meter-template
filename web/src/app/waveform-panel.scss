@@ -26,8 +26,120 @@ header h2 {
   color: #6b7280;
 }
 
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 1.25rem;
+
+  @media (max-width: 560px) {
+    flex-direction: column;
+  }
+}
+
 .chart {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 0;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+  width: 4.5rem;
+  flex-shrink: 0;
+  padding-top: 0.25rem;
+
+  @media (max-width: 560px) {
+    flex-direction: row;
+    width: 100%;
+    height: 4.5rem;
+  }
+}
+
+.lamp {
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 50%;
+  background: #9ca3af;
+  border: 2px solid rgba(0, 0, 0, 0.1);
+  transition:
+    background-color 0.4s ease,
+    box-shadow 0.4s ease;
+  flex-shrink: 0;
+}
+
+.scale {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1;
+  min-height: 0;
+
+  @media (max-width: 560px) {
+    flex-direction: row;
+  }
+}
+
+.scale-value {
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: #374151;
+}
+
+.scale-label {
+  font-size: 0.6875rem;
+  color: #9ca3af;
+  text-align: center;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+
+  @media (max-width: 560px) {
+    writing-mode: horizontal-tb;
+    transform: none;
+  }
+}
+
+// A vertical slider, built by rotating a normal horizontal <input
+// type="range"> rather than relying on `writing-mode`/`-webkit-appearance:
+// slider-vertical` — those two vertical-orientation techniques conflict
+// with each other (mixing them left the thumb undraggable in Chromium) and
+// neither is supported everywhere on its own. A CSS `rotate` keeps the
+// input a completely ordinary horizontal slider as far as layout and
+// pointer hit-testing are concerned, which every browser drags correctly;
+// only its rendering is rotated. Its length (the *pre-rotation* width) is
+// set from TypeScript, not here, to exactly fill this wrapper's height —
+// see WaveformPanel's `sliderLengthPx` — since CSS alone can't express
+// "my width equals my ancestor's height".
+.slider-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+
+  @media (max-width: 560px) {
+    flex-direction: column;
+  }
+}
+
+.scale input[type='range'] {
+  margin: 0;
+  cursor: pointer;
+  accent-color: #d97706;
+  transform: rotate(-90deg);
+
+  @media (max-width: 560px) {
+    // Below the breakpoint the sidebar (and this slider) lay out
+    // horizontally instead, so the rotation — and the height-derived pixel
+    // width set from TypeScript — no longer apply; !important is needed to
+    // beat that inline style's specificity.
+    width: 100% !important;
+    transform: none;
+  }
 }

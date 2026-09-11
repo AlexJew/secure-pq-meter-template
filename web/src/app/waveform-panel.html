@@ -7,7 +7,32 @@
   } @else {
     <p class="subtitle">Waiting for the first measurement…</p>
   }
-  <div class="chart">
-    <canvas baseChart [data]="data()" [options]="options" [type]="'line'"></canvas>
+  <div class="body">
+    <div class="chart">
+      <canvas baseChart [data]="data()" [options]="options()" [type]="'line'"></canvas>
+    </div>
+    <aside class="sidebar">
+      <div
+        class="lamp"
+        [style.background]="lampColor()"
+        [style.boxShadow]="'0 0 0.75rem ' + lampColor()"
+        title="Power factor {{ powerFactor() ?? '?' }}"
+      ></div>
+      <div class="scale">
+        <span class="scale-value">{{ currentScaleA() }} A</span>
+        <div class="slider-wrap" #sliderWrap>
+          <input
+            type="range"
+            min="0"
+            [max]="currentScaleMax"
+            step="1"
+            [value]="currentScaleIndex()"
+            [style.width.px]="sliderLengthPx()"
+            (input)="onCurrentScaleInput($event)"
+          />
+        </div>
+        <span class="scale-label">current scale</span>
+      </div>
+    </aside>
   </div>
 </section>
