@@ -10,6 +10,17 @@
 # nothing to click through — start the server and client (or
 # scripts/run-dummy.sh --live) and readings should appear within a few
 # seconds of the first pull.
+#
+# Optional: to share that dashboard off this machine, set NGROK_AUTHTOKEN
+# (from https://dashboard.ngrok.com/get-started/your-authtoken, e.g. in a
+# git-ignored .env file next to this compose file) and also start the ngrok
+# profile:
+#   docker compose --profile share up -d
+# ngrok prints its public URL to its own logs (`docker compose logs ngrok`)
+# or the local inspection dashboard at http://localhost:4040. Without
+# NGROK_DOMAIN set too, that URL is randomly assigned on every start; set it
+# to your account's free static domain (Domains section of the ngrok
+# dashboard, looks like your-name.ngrok-free.app) for a stable one instead.
 services:
   grafana:
     image: grafana/grafana-oss:13.0.2
@@ -35,6 +46,36 @@ services:
       # a read-only mount breaks reads outright, and bind-mounting only the
       # ".db" file breaks the moment SQLite replaces that inode.
       - ./data:/data
+
+  # Opt-in (see the "Optional" note above): exposes Grafana at a public
+  # ngrok URL instead of only http://localhost:3000. Reaches the grafana
+  # service by its compose network name, not localhost/host.docker.internal.
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    profiles: [share]
+    # A shell, not the image's default exec-form command: compose expands
+    # ${NGROK_DOMAIN:+ --url $NGROK_DOMAIN} itself (same interpolation as
+    # NGROK_AUTHTOKEN below, from the host env / .env, before the container
+    # ever starts) into either nothing or " --url your-domain" within this
+    # one string -- an exec-form list can't express "add this arg only if
+    # set" the same way, since an unset var there leaves a stray empty
+    # argument instead of removing the flag. `sh -c` then just word-splits
+    # the already-substituted string into ngrok's argv. Set NGROK_DOMAIN to
+    # your account's free static domain (see the "Optional" note above) for
+    # a stable URL; leave it unset to fall back to ngrok's own random one.
+    entrypoint: ['sh', '-c']
+    command: ['ngrok http grafana:3000${NGROK_DOMAIN:+ --url $NGROK_DOMAIN}']
+    environment:
+      # Not `:?required` -- that form is checked during interpolation, before
+      # profile filtering, and would break plain `docker compose up -d` (no
+      # --profile share) even though this service isn't started then. Left
+      # empty, the ngrok image itself exits with a clear error asking for it.
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    ports:
+      - '4040:4040'
+    depends_on:
+      - grafana
 
 volumes:
   grafana_storage: {}
