@@ -1,0 +1,120 @@
+{
+  "uid": "pq-meter",
+  "title": "PQ Meter",
+  "tags": ["pq-meter"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "5s",
+  "time": { "from": "now-2d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "gateway",
+        "type": "query",
+        "label": "Gateway",
+        "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+        "query": "SELECT DISTINCT gateway FROM readings ORDER BY gateway",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "L1 voltage",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, voltage_l1_v AS \"L1 voltage (V)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "L1 current",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, current_l1_a AS \"L1 current (A)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "L1 active power",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, active_power_l1_w AS \"L1 active power (W)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "L1 reactive power",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, reactive_power_l1_var AS \"L1 reactive power (var)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "L1 phase angle",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, phase_angle_l1_deg AS \"L1 phase angle (deg)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    }
+  ]
+}

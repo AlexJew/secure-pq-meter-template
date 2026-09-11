@@ -13,11 +13,37 @@ meant to be queried for analysis, so it's fine to delete and recreate it on a
 schema change rather than migrate it.
 
 The server's store is the opposite: it's the durable, queryable copy meant
-for analysis, dashboards (see `crates/pq-meter-server/TODO.md`'s "Later:
-Grafana" section), and anything that needs history across gateways. This is
-why `crates/pq-meter-server/TODO.md`'s plan adds real persistence on the
-server rather than treating `data.json` (or the client's DB) as the
-analysis-ready copy.
+for analysis, dashboards (see `crates/pq-meter-server/TODO.md`'s "Grafana"
+section), and anything that needs history across gateways. This is why the
+server has its own `ServerStore` (`crates/pq-meter-server/src/storage.rs`)
+rather than treating `data.json` (removed) or the client's DB as the
+analysis-ready copy. Unlike the client's store, its `readings` table's value
+columns are nullable and only ever grow (`ALTER TABLE ADD COLUMN`, never a
+migration or a backfilled default) — see the "fail loud" entry below for why
+that's the opposite rule from the client's, deliberately.
+
+## Server history survives a gateway reconnect; gateways need an identity
+
+A gateway (`pq-meter-client`) always asks the server for "everything since
+its last acked index" from its own history, and a `CONNECT` tunnel is a fresh
+in-memory session on the server, per connection. Naively starting each
+session's pull cursor at `0` — as the very first server implementation did —
+means a gateway reconnecting after any network hiccup gets its entire history
+re-sent and re-counted from the beginning, every time. `ServerStore` persists
+the pull cursor per gateway identity precisely so a reconnect resumes instead
+of restarting.
+
+That identity has to come from somewhere the client controls: the tunnel's
+own `authority` is the server's own TLS name (`pq-meter-server:<port>`,
+identical for every client), so it cannot tell gateways apart. The client
+instead sends an `x-pq-gateway-id` header on the `CONNECT` request itself —
+one extra header on the request that was already being sent, not a second
+connection or a change to the NDJSON message schema. See
+`CONNECT_PROTOCOL.md`'s "Gateway Identity and History Resets" section for the
+full mechanism, including how a client's own database being deleted and
+recreated (its row ids restarting near `0`) is detected and self-heals via a
+`latest_index` field on every Data Reply, rather than needing yet another
+piece of persisted identity.
 
 ## Fail loud on schema change, don't auto-migrate
 

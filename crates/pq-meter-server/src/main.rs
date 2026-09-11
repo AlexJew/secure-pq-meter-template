@@ -9,6 +9,7 @@
 
 mod api;
 mod network;
+mod storage;
 
 use std::{net::IpAddr, path::PathBuf, sync::Arc};
 
@@ -36,9 +37,12 @@ struct Args {
     #[arg(long, default_value = api::DEFAULT_PATH)]
     path: String,
 
-    /// File the received meter data is written to.
-    #[arg(long, default_value = "data.json")]
-    data_file: PathBuf,
+    /// SQLite file received meter data is persisted to. Created if it does
+    /// not exist; kept (not truncated) across restarts, since it is the
+    /// durable, queryable history this project's Grafana dashboards read
+    /// from directly — see `crates/pq-meter-server/TODO.md`.
+    #[arg(long, default_value = "data/pqmeter.db")]
+    db: PathBuf,
 }
 
 #[tokio::main]
@@ -54,10 +58,10 @@ async fn main() -> anyhow::Result<()> {
     // The SDK uses rustls for its control plane; pick a crypto backend.
     scion_sdk_utils::rustls::select_ring_crypto_provider();
 
-    // Start the data file fresh; the tunnels rewrite it as they receive data.
-    std::fs::File::create(&args.data_file).with_context(|| {
-        format!("creating the data file {}", args.data_file.display())
-    })?;
+    if let Some(parent) = args.db.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating the database directory {}", parent.display()))?;
+    }
 
     let network = network::start(args.bind_ip).await?;
 
@@ -83,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         api::PULL_INTERVAL.as_secs()
     );
     println!("  accepting POST on:   {}", args.path);
-    println!("  writing data to:     {}", args.data_file.display());
+    println!("  database:            {}", args.db.display());
     println!();
     println!("Start the client with:");
     // The address is quoted because a shell would otherwise read the square brackets as a
@@ -97,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     api::serve(
         Arc::new(socket) as Arc<dyn GenericScionUdpSocket>,
         &args.path,
-        &args.data_file,
+        &args.db,
     )
     .await
 }

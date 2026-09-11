@@ -17,6 +17,7 @@ http-body = { workspace = true }
 http-body-util = { workspace = true }
 pocketscion = { workspace = true }
 rcgen = { workspace = true }
+rusqlite = { workspace = true }
 scion-quic = { workspace = true }
 scion-sdk-utils = { workspace = true }
 scion-stack = { workspace = true }

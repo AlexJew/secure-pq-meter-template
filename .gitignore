@@ -20,5 +20,13 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Local secrets (e.g. NGROK_AUTHTOKEN and NGROK_DOMAINfor docker-compose.yml's ngrok service)
+.env
+
 # Data files
-data.json
+# pq-meter-server's durable SQLite store (see crates/pq-meter-server/TODO.md);
+# data.json is gone, replaced by this.
+/data/
+# pq-meter-client's local replay buffer (WAL mode also leaves -shm/-wal
+# siblings) wherever it's run from the repo root, e.g. scripts/run-dummy.sh.
+pqmeter.db*

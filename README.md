@@ -23,15 +23,19 @@ crates/
     src/main.rs            Command line interface, starts everything
     src/network.rs         The simulated SCION network (which ASes, which addresses)
     src/api.rs             The HTTP/3 endpoint; serves CONNECT data tunnels and a POST route
+    src/storage.rs         The durable, per-gateway SQLite store received data lands in
   pq-meter-client/         Runs on the gateway
     src/main.rs            Maintains the CONNECT tunnel, records and serves readings
     src/meter/mod.rs       The MeterSource trait, generic across meter types
     src/meter/umg605.rs    The Modbus-backed UMG 605-PRO implementation
+    src/storage.rs         The local SQLite replay buffer (transient, see DESIGN_DECISIONS.md)
   umg605-modbus-client/    Reads data from a UMG 605-PRO power quality meter over Modbus TCP
     src/lib.rs             The Modbus TCP client and the registers it reads
     bin/pinger.rs          Example binary that reads values from the meter
+grafana/                   Datasource and dashboard provisioned into the Grafana container below
 Cargo.toml                 Workspace, pins the SCION SDK version
 rust-toolchain.toml        Rust version used to build this repository
+docker-compose.yml         Runs Grafana against the server's SQLite file, see below
 scripts/run-dummy.sh       Runs the client against its dummy meter, see below
 ```
 
@@ -89,7 +93,7 @@ SCION network is up
   HTTP/3 server:       [2-ff00:0:212,127.0.0.1]:59218
   accepting CONNECT tunnels (pulling data every 5s)
   accepting POST on:   /edh/v1/hello
-  writing data to:     data.json
+  database:            data/pqmeter.db
 
 Start the client with:
   pq-meter-client --endhost-api http://127.0.0.1:31000/ --server '[2-ff00:0:212,127.0.0.1]:59218'
@@ -108,12 +112,14 @@ The client opens a bidirectional `CONNECT` tunnel and stays connected. Every 5
 seconds the server pulls new measurements through the tunnel; the client
 records one fresh Modbus snapshot in its SQLite database, then answers with
 every stored row after the server's cursor. The server prints each measurement
-and keeps them in `data.json`:
+and stores them in `data/pqmeter.db`, keyed by gateway identity so a
+reconnect resumes instead of re-sending everything (see
+`crates/pq-meter-server/TODO.md`):
 
 ```text
-data tunnel opened by Some("[2-ff00:0:212,127.0.0.1]:59218")
+data tunnel opened by gateway "127.0.0.1:31000"
 data: {"index":1,"timestamp":"1789050000000","voltage_l1_v":230.01,"current_l1_a":1.6}
-received 1 measurement(s) from the gateway
+received 1 measurement(s) from gateway "127.0.0.1:31000" (1 new, 0 already stored)
 ```
 
 The server and the client both keep running; stop them with Ctrl-C.
@@ -140,6 +146,59 @@ scripts/run-dummy.sh --live   # starts pq-meter-server, scrapes its address, and
 
 See `crates/pq-meter-client/METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`,
 the real Modbus-backed `ModbusMeter`, and the script fit together.
+
+## Dashboards with Grafana
+
+The server keeps every gateway's history in a SQLite file
+(`data/pqmeter.db` by default), which a `docker compose`-managed Grafana can
+read directly — no `/metrics` endpoint or separate time-series database to
+run. With the server (and a client, real or `--dummy-meter`) already
+running:
+
+```bash
+docker compose up -d
+open http://localhost:3000     # anonymous Viewer access, local demo only
+```
+
+The datasource and a dashboard (one panel each for voltage, current, active
+and reactive power, and phase angle, filterable by gateway) are provisioned
+from `grafana/`, so there's nothing to click together — new readings should
+appear within a few seconds. See `crates/pq-meter-server/TODO.md`'s "Grafana,
+direct on SQLite" section for how this is wired and what to check if a panel
+stays empty or Grafana reports the database as locked.
+
+```bash
+docker compose down            # stop Grafana; add -v to also drop its own settings
+```
+
+### If a panel stays empty even though data is flowing
+
+Each reading's timestamp is stamped by the *gateway's own clock* at the
+moment `pq-meter-client` records it (`ts_millis`), not by the server when it
+arrives — so a Raspberry Pi with a wrong system clock (no battery-backed RTC,
+booted without network before NTP could correct it) produces readings that
+are internally consistent and steadily increasing, but dated hours or days
+off from reality. The server logs `received N measurement(s) ... (N new, 0
+already stored)` the whole time, so the pipeline looks perfectly healthy —
+the rows are just timestamped somewhere the dashboard's time window doesn't
+reach.
+
+The dashboard's default range is the last two days for exactly this reason.
+If it's still empty:
+
+```bash
+sqlite3 data/pqmeter.db "SELECT gateway, MAX(ts_millis) FROM readings GROUP BY gateway;"
+python3 -c "import time; print(int(time.time()*1000))"   # compare to the above
+```
+
+A gap that's a round number of hours (≤ 14) is a timezone issue; anything
+else — especially a gap on the order of a day that keeps growing — means the
+gateway's clock is wrong. Fix it on the gateway (`timedatectl status`, then
+`sudo timedatectl set-ntp true` or `sudo date -s "@$(date +%s)"`), not in
+Grafana or the server. Once the clock is right, widen the dashboard's own
+time range back down (e.g. to the last hour) — edit `time` in
+`grafana/dashboards/pq-meter.json`, which the running container picks up
+automatically within its `updateIntervalSeconds` (10s), no restart needed.
 
 ## Run it between the Pi and the laptop
 
@@ -373,8 +432,9 @@ cargo cross build --release -p umg605-modbus-client --bin pinger --target aarch6
 * **Send your own data.** The client returns stored SQLite rows from `handle_line()` in
   `crates/pq-meter-client/src/main.rs`, using SQLite row IDs as the incremental protocol index.
 * **Receive your own data.** The server's `tunnel_session()` in `crates/pq-meter-server/src/api.rs`
-  prints each measurement and keeps them in `data.json`. Everything other than `CONNECT` still
-  goes through the Axum router.
+  prints each measurement and stores it via `ServerStore` (`src/storage.rs`) — see that module's
+  doc comment for the schema, and `crates/pq-meter-server/TODO.md` for why it differs from the
+  client's own store. Everything other than `CONNECT` still goes through the Axum router.
 * **Look at paths.** SCION lets an application see and choose the paths to a destination. The
   [academy](https://learn.anapaya.net/docs/academy/scion-sdk/) explains how paths are built,
   and `crates/pq-meter-server/src/network.rs` is where you would add more autonomous systems

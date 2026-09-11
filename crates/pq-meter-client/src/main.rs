@@ -46,6 +46,10 @@ use url::Url;
 /// TLS name the server's certificate is issued for.
 const SERVER_NAME: &str = "pq-meter-server";
 
+/// Header carrying this gateway's stable identity on the CONNECT request, see
+/// `CONNECT_PROTOCOL.md`'s "Gateway Identity and History Resets" section.
+const GATEWAY_ID_HEADER: &str = "x-pq-gateway-id";
+
 /// Largest NDJSON line accepted from the server before the tunnel is closed.
 const MAX_LINE_SIZE: usize = 64 * 1024;
 
@@ -118,6 +122,14 @@ struct TunnelArgs {
     /// does not exist.
     #[arg(long, default_value = "pqmeter.db")]
     db: PathBuf,
+
+    /// Identity this gateway sends on the CONNECT request (the
+    /// `x-pq-gateway-id` header, see `CONNECT_PROTOCOL.md`), so the server can
+    /// tell multiple gateways apart and persist a pull cursor per gateway.
+    /// Defaults to the endhost API's host and port, which is unique per SNAP;
+    /// pass this explicitly in a real deployment.
+    #[arg(long)]
+    gateway_id: Option<String>,
 }
 
 /// Arguments for recording meter readings without a SCION connection.
@@ -292,10 +304,22 @@ async fn run(args: TunnelArgs) -> anyhow::Result<()> {
     let meter_kind = meter.kind();
     let mut gateway = Gateway { meter, store };
 
+    // Defaults to the endhost API's host:port, which is unique per SNAP and
+    // needs no extra configuration for the common case of one gateway per
+    // machine; a real deployment with several gateways behind one SNAP should
+    // pass --gateway-id explicitly.
+    let gateway_id = args.gateway_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            args.endhost_api.host_str().unwrap_or("unknown"),
+            args.endhost_api.port_or_known_default().unwrap_or(0)
+        )
+    });
+
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        tracing::info!(server = %args.server, kind = meter_kind, "opening tunnel");
-        match run_tunnel(&client, &authority, &mut gateway).await {
+        tracing::info!(server = %args.server, kind = meter_kind, gateway_id = %gateway_id, "opening tunnel");
+        match run_tunnel(&client, &authority, &gateway_id, &mut gateway).await {
             Ok(()) => {
                 tracing::info!("tunnel closed, reconnecting");
                 backoff = INITIAL_BACKOFF;
@@ -328,11 +352,13 @@ async fn build_socket(endhost_api: &Url) -> anyhow::Result<Arc<dyn GenericScionU
 async fn run_tunnel(
     client: &Http3Client,
     authority: &str,
+    gateway_id: &str,
     gateway: &mut Gateway,
 ) -> anyhow::Result<()> {
     let request = http::Request::builder()
         .method(http::Method::CONNECT)
         .uri(format!("https://{authority}"))
+        .header(GATEWAY_ID_HEADER, gateway_id)
         .body(())
         .context("building the CONNECT request")?;
 
@@ -419,13 +445,24 @@ where
                     }
 
                     match gateway.store.since_id(from_index as i64, 10_000) {
-                        Ok(readings) => json!({
-                            "type": "data",
-                            "id": id,
-                            "payload": {
-                                "data": readings.iter().map(stored_reading_json).collect::<Vec<_>>(),
-                            },
-                        }),
+                        Ok(readings) => {
+                            // Reported unconditionally, including alongside an
+                            // empty `data` array: it is the gateway's current
+                            // high-water mark, not tied to this batch, and is
+                            // what lets the server notice its stored history
+                            // has shrunk (this database file was deleted and
+                            // recreated) instead of asking forever for
+                            // indexes past what a fresh file will ever reach.
+                            let latest_index = gateway.store.max_id().unwrap_or(0);
+                            json!({
+                                "type": "data",
+                                "id": id,
+                                "payload": {
+                                    "data": readings.iter().map(stored_reading_json).collect::<Vec<_>>(),
+                                    "latest_index": latest_index,
+                                },
+                            })
+                        }
                         Err(err) => {
                             tracing::warn!(id, error = ?err, "failed to read stored readings");
                             json!({
@@ -676,6 +713,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_reply_reports_the_stores_current_high_water_mark() {
+        let mut gateway = test_gateway();
+        for ts in [100, 200, 300] {
+            gateway.store.insert(&sample(ts)).unwrap();
+        }
+        let input = ndjson(&[json!({"type": "data", "id": 1, "payload": {"index": 3}})]);
+        let (_, replies) = serve_input(&mut gateway, &input).await;
+
+        let reply = &parse_replies(&replies)[0];
+        // One dummy reading was inserted answering this request, on top of
+        // the three seeded above.
+        assert_eq!(reply["payload"]["latest_index"], 4);
+        assert_eq!(reply["payload"]["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn unknown_type_is_answered_with_an_error() {
         let mut gateway = test_gateway();
         let input = ndjson(&[
@@ -761,6 +814,36 @@ mod tests {
         let tunnel = args.tunnel.expect("tunnel args parsed");
         assert_eq!(tunnel.db, PathBuf::from("pqmeter.db"));
         assert_eq!(tunnel.meter_ip.unwrap().to_string(), "192.168.1.50");
+    }
+
+    #[test]
+    fn gateway_id_defaults_to_none_and_can_be_set_explicitly() {
+        let default_args = Args::try_parse_from([
+            "pq-meter-client",
+            "--endhost-api",
+            "http://127.0.0.1:31000/",
+            "--server",
+            "[2-ff00:0:212,127.0.0.1]:59218",
+            "--dummy-meter",
+        ])
+        .unwrap();
+        assert_eq!(default_args.tunnel.unwrap().gateway_id, None);
+
+        let explicit_args = Args::try_parse_from([
+            "pq-meter-client",
+            "--endhost-api",
+            "http://127.0.0.1:31000/",
+            "--server",
+            "[2-ff00:0:212,127.0.0.1]:59218",
+            "--dummy-meter",
+            "--gateway-id",
+            "pi-north",
+        ])
+        .unwrap();
+        assert_eq!(
+            explicit_args.tunnel.unwrap().gateway_id,
+            Some("pi-north".to_string())
+        );
     }
 
     #[test]

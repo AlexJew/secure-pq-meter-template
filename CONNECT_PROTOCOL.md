@@ -37,19 +37,55 @@ its write half while the tunnel is active.
 ```text
 pq-meter-client                              pq-meter-server
        |                                            |
-       | ------- HTTP/3 CONNECT /edh/v1/tunnel ---> |
+       | -- CONNECT, x-pq-gateway-id: pi-north ---> |
        |                                            |
        | <--------------------- 200 OK ------------ |
        |                                            |
        | <--- {"type":"data","id":1,"payload":{}}\n
        |                                            |
-       | --- {"type":"data","id":1,"payload":{"data":{...}}}\n --> |
+       | --- {"type":"data","id":1,"payload":{"data":{...},"latest_index":1}}\n --> |
        |                                            |
 ```
 
 The client always initiates the tunnel. The server issues data requests only
 after it has accepted the client connection and retained the server-to-client
 write handle for that tunnel.
+
+## Gateway Identity and History Resets
+
+The `CONNECT` request carries one header, `x-pq-gateway-id`, naming the
+gateway opening the tunnel (`pq-meter-client`'s `--gateway-id`, defaulting to
+its endhost API's `host:port`). This is a header on the request the client
+was already sending, not a second connection: the pinned SCION SDK forwards
+ordinary headers on a `CONNECT` request in both directions, even though it
+drops `:path`/`:scheme` for it (classic RFC 9114 `CONNECT`).
+
+The server persists received history and its pull cursor keyed on this
+identity, so multiple gateways sharing one server don't collide, and a
+reconnecting gateway resumes from its own last-pulled index instead of
+re-pulling (and double-counting) its entire history from `0`. A tunnel with
+no header — an older client — is attributed to the identity `"unknown"` and a
+warning is logged; a second such gateway would mix into the same history.
+
+The client's local database (`pqmeter.db`) is a transient replay buffer (see
+`DESIGN_DECISIONS.md`) that may be deleted and recreated at any time, which
+resets the client's own row ids back down near `0`. Without something to
+notice this, the server would keep asking "everything after index N" for an
+N the fresh database will never reach again, and no data would ever flow.
+Every Data Reply therefore also carries `payload.latest_index`: the client's
+current high-water mark, reported whether or not that reply's `data` array is
+empty. If a reply's `latest_index` is lower than the index the server just
+asked "everything after", the server resets that gateway's cursor to `0`, so
+its next request asks for everything and the gateway's data resumes flowing
+within the next pull. (A client too old to send `latest_index` is never
+reset this way — a missing field is not treated as a drop to zero.)
+
+This detects a shrunk history by it going backwards, so it cannot detect one
+that has already climbed back past the old mark before the server next talks
+to that gateway — for example, the client run alone in `record` mode for long
+enough after its database was recreated. That gap is accepted: closing it
+would need an identity tied to the database file itself (e.g. a stored
+creation-time epoch) rather than a number that only moves forward.
 
 ## Message Framing
 
@@ -130,7 +166,10 @@ The client sends this message on the HTTP request body after reading the meter:
                 "value2": "Any data",
                 "index": 2 // Increasing index after each data request
             },
-        ]
+        ],
+        "latest_index": 2 // The client's current high-water mark; see
+                          // "Gateway Identity and History Resets" above.
+                          // Present even when "data" is empty.
     }
 }
 ```

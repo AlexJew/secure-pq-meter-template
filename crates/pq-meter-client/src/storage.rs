@@ -149,6 +149,23 @@ impl MeterStore {
         )
     }
 
+    /// The largest [`StoredReading::id`] ever inserted, or `0` if nothing has
+    /// been inserted (including when the `readings` table does not exist
+    /// yet).
+    ///
+    /// This is the gateway's own high-water mark, reported alongside every
+    /// data reply so the server can tell a shrunk history (this database file
+    /// was deleted and recreated) from a normal pull — see
+    /// `CONNECT_PROTOCOL.md`'s "Gateway Identity and History Resets" section.
+    pub fn max_id(&self) -> Result<i64> {
+        if self.value_column_names()?.is_none() {
+            return Ok(0);
+        }
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM readings", [], |row| row.get(0))?)
+    }
+
     /// Runs one `SELECT ... {clause}` over every value column of the `readings`
     /// table, in its own column order, and maps each row back to a
     /// [`StoredReading`]. Returns no rows if the table does not exist yet
@@ -450,6 +467,21 @@ mod tests {
         assert_eq!(store.latest(10).unwrap(), vec![]);
         assert_eq!(store.since_id(0, 10).unwrap(), vec![]);
         assert_eq!(store.query(0, i64::MAX).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn max_id_is_zero_on_an_empty_store() {
+        let store = MeterStore::open_in_memory().unwrap();
+        assert_eq!(store.max_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn max_id_tracks_the_newest_insert() {
+        let store = MeterStore::open_in_memory().unwrap();
+        for ts in [100, 200, 300] {
+            store.insert(&sample(ts)).unwrap();
+        }
+        assert_eq!(store.max_id().unwrap(), 3);
     }
 
     fn now_millis() -> i64 {
