@@ -31,10 +31,21 @@
 //! before using them as SQL column names, and caps how many distinct columns
 //! one database file will grow to.
 //!
-//! Each tunnel session opens its own [`ServerStore`] on the same path, same
-//! as the client's convention: `rusqlite::Connection` is not `Sync`, and WAL
-//! mode is what lets concurrent sessions (and a Grafana reader) touch the
-//! file without blocking each other.
+//! One [`ServerStore`] (behind a lock) is shared by every tunnel session —
+//! `rusqlite::Connection` is not `Sync`, so callers serialize access rather
+//! than each opening their own; concurrent connections independently
+//! initializing the same fresh WAL-mode file raced each other into spurious
+//! `SQLITE_IOERR`s. WAL mode itself is what lets a Grafana reader touch the
+//! file without blocking the writer.
+//!
+//! A reader outside this process (Grafana, reading the file directly — see
+//! `docker-compose.yml`) only ever sees data that has been checkpointed from
+//! the WAL into the base file: WAL-mode's cross-connection visibility relies
+//! on a memory-mapped `-shm` index file, and that kind of shared-memory
+//! coherency does not reliably survive a Docker Desktop bind mount. Frequent
+//! checkpointing (see [`ServerStore::checkpoint`]) keeps that window small by
+//! moving fresh rows into ordinary pages a plain file read picks up fine,
+//! without depending on `-shm` coherency at all.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -187,6 +198,16 @@ impl ServerStore {
     #[cfg(test)]
     fn value_column_names(&self) -> Result<Vec<String>> {
         value_column_names(&self.conn)
+    }
+
+    /// Moves committed WAL frames into the base file, without blocking a
+    /// concurrent reader or writer (it simply checkpoints as much as it can
+    /// without waiting for one to finish). See the module doc comment for why
+    /// an external reader needs this run often rather than left to WAL mode's
+    /// own (much less frequent) automatic checkpointing.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        Ok(())
     }
 }
 

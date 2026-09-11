@@ -31,9 +31,9 @@
 //! `payload.latest_index` is for.
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -86,6 +86,13 @@ pub const SERVER_NAME: &str = "pq-meter-server";
 /// How often the server pulls new data from the gateway.
 pub const PULL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the shared store checkpoints its WAL into the base file, so an
+/// external reader (Grafana, see the `storage` module doc comment) sees fresh
+/// rows without depending on `-shm` coherency across a Docker Desktop bind
+/// mount. Shorter than [`PULL_INTERVAL`] so a checkpoint always follows the
+/// pull that just landed new rows within one cycle.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Serves the HTTP/3 application on `socket` until the process is stopped.
 pub async fn serve(
     socket: Arc<dyn GenericScionUdpSocket>,
@@ -94,10 +101,15 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let app = Router::new().route(path, post(receive));
     let config = quic_config().context("building the QUIC server configuration")?;
-    let service = MeterService {
-        app,
-        db_path: db_path.to_path_buf(),
-    };
+    // One connection shared by every tunnel session (past and future gateways
+    // alike): opening a fresh `Connection` per `CONNECT` let concurrent
+    // reconnects race each other initializing the same WAL-mode file, which
+    // surfaced as spurious "disk I/O error"s under rapid reconnects.
+    let store = ServerStore::open(db_path)
+        .with_context(|| format!("opening the database at {}", db_path.display()))?;
+    let store = Arc::new(Mutex::new(store));
+    tokio::spawn(checkpoint_periodically(store.clone()));
+    let service = MeterService { app, store };
 
     let metrics = Metrics::new_without_registry();
     let endpoint =
@@ -128,7 +140,7 @@ async fn receive(body: String) -> (StatusCode, &'static str) {
 /// the axum router.
 struct MeterService {
     app: Router,
-    db_path: PathBuf,
+    store: Arc<Mutex<ServerStore>>,
 }
 
 impl HttpService for MeterService {
@@ -137,7 +149,7 @@ impl HttpService for MeterService {
 
     async fn call(&self, req: http::Request<H3RequestBody>) -> http::Response<ResponseBody> {
         if req.method() == http::Method::CONNECT {
-            return connect_tunnel(req, &self.db_path);
+            return connect_tunnel(req, self.store.clone());
         }
 
         let response: http::Response<AxumBody> = self
@@ -159,7 +171,7 @@ impl HttpService for MeterService {
 /// Opens a bidirectional data tunnel for a `CONNECT` request: answers with
 /// `200`, then serves the tunnel with a background task while the response
 /// body streams the server's data requests out to the gateway.
-fn connect_tunnel(req: http::Request<H3RequestBody>, db_path: &PathBuf) -> http::Response<ResponseBody> {
+fn connect_tunnel(req: http::Request<H3RequestBody>, store: Arc<Mutex<ServerStore>>) -> http::Response<ResponseBody> {
     let gateway = req
         .headers()
         .get(GATEWAY_ID_HEADER)
@@ -177,7 +189,7 @@ fn connect_tunnel(req: http::Request<H3RequestBody>, db_path: &PathBuf) -> http:
 
     let (_parts, body) = req.into_parts();
     let (out, rx) = unbounded_channel();
-    tokio::spawn(tunnel_session(body, out, db_path.clone(), gateway));
+    tokio::spawn(tunnel_session(body, out, store, gateway));
 
     let mut response = http::Response::new(ResponseBody::Tunnel(rx));
     *response.status_mut() = StatusCode::OK;
@@ -189,20 +201,17 @@ fn connect_tunnel(req: http::Request<H3RequestBody>, db_path: &PathBuf) -> http:
 ///
 /// The session ends when the gateway closes the tunnel, when the connection
 /// drops, or when the response side is gone.
-async fn tunnel_session(mut body: H3RequestBody, out: UnboundedSender<Bytes>, db_path: PathBuf, gateway: String) {
-    let mut store = match ServerStore::open(&db_path) {
-        Ok(store) => store,
-        Err(err) => {
-            eprintln!("could not open {db_path:?}: {err}");
-            return;
-        }
-    };
-
+async fn tunnel_session(
+    mut body: H3RequestBody,
+    out: UnboundedSender<Bytes>,
+    store: Arc<Mutex<ServerStore>>,
+    gateway: String,
+) {
     // The index the gateway has sent data up to so far; the next pull asks
     // for everything since it (0 = from the beginning). Resumed from this
     // gateway's last stored cursor, so a reconnect does not re-pull (and
     // double-count) its entire history from index 0 (TODO item 3).
-    let mut last_index: u64 = match store.cursor(&gateway) {
+    let mut last_index: u64 = match store.lock().unwrap().cursor(&gateway) {
         Ok(cursor) => cursor,
         Err(err) => {
             eprintln!("could not read the stored cursor for {gateway:?}: {err}");
@@ -236,9 +245,23 @@ async fn tunnel_session(mut body: H3RequestBody, out: UnboundedSender<Bytes>, db
                 };
                 pending.extend_from_slice(&data);
                 while let Some(line) = next_line(&mut pending) {
-                    record_data(&line, &gateway, &mut last_index, &mut store);
+                    record_data(&line, &gateway, &mut last_index, &store);
                 }
             }
+        }
+    }
+}
+
+/// Runs for the life of the process, checkpointing `store`'s WAL into the
+/// base file every [`CHECKPOINT_INTERVAL`]. See the `storage` module doc
+/// comment for why an external reader needs this.
+async fn checkpoint_periodically(store: Arc<Mutex<ServerStore>>) {
+    let mut ticker = interval(CHECKPOINT_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = store.lock().unwrap().checkpoint() {
+            eprintln!("WAL checkpoint failed, will retry: {err}");
         }
     }
 }
@@ -263,7 +286,7 @@ fn send_pull_request(out: &UnboundedSender<Bytes>, id: u64, from: u64) -> bool {
 /// or resets it to `0` if the gateway's own reported high-water mark
 /// (`payload.latest_index`) shows its history has shrunk since the request
 /// this reply answers — see [`needs_reset`] and `CONNECT_PROTOCOL.md`.
-fn record_data(line: &[u8], gateway: &str, last_index: &mut u64, store: &mut ServerStore) {
+fn record_data(line: &[u8], gateway: &str, last_index: &mut u64, store: &Mutex<ServerStore>) {
     let message: Value = match serde_json::from_slice(line) {
         Ok(message) => message,
         Err(err) => {
@@ -296,7 +319,7 @@ fn record_data(line: &[u8], gateway: &str, last_index: &mut u64, store: &mut Ser
         }
     }
 
-    match store.record_batch(gateway, new_last_index, &rows) {
+    match store.lock().unwrap().record_batch(gateway, new_last_index, &rows) {
         Ok(recorded) => println!(
             "received {} measurement(s) from gateway {gateway:?} ({} new, {} already stored)",
             rows.len(),
