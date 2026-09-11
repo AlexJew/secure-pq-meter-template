@@ -230,6 +230,16 @@ from the Pi:
 | 31020 | TCP      | SNAP control plane, server AS                        |
 | 31021 | UDP      | SNAP data plane, server AS                           |
 
+The HTTP/3 server itself (the `--server` address printed above, `:59218` in that example) binds
+to a random port that changes on every restart, unless you pin it with `--port`:
+
+```bash
+cargo run -p pq-meter-server -- --bind-ip 192.168.1.42 --port 45000
+```
+
+That keeps the printed `--server` address (and the port a firewall needs to allow) stable across
+restarts, so you don't have to copy a new one into the client command each time.
+
 If the client hangs or reports a connection error, the usual cause is a firewall on the
 laptop that blocks these ports:
 

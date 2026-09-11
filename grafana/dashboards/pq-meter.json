@@ -115,6 +115,114 @@
           "queryText": ""
         }
       ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "L1 power factor",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, power_factor_l1 AS \"L1 power factor\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "L1 fundamental power factor",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, power_factor_fundamental_l1 AS \"L1 fundamental power factor (cos phi)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "L1 power factor sign",
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, power_factor_sign_l1 AS \"L1 power factor sign (+1 inductive / -1 capacitive)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "L1 current THD",
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, current_thd_l1_pct AS \"L1 current THD (%)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "L1 current peaks",
+      "gridPos": { "x": 0, "y": 40, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, current_peak_positive_l1_a AS \"L1 current positive peak (A)\", current_peak_negative_l1_a AS \"L1 current negative peak (A)\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "L1 current crest factor",
+      "gridPos": { "x": 12, "y": 40, "w": 12, "h": 8 },
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "pqmeter" },
+          "queryType": "time series",
+          "timeColumns": ["time"],
+          "rawQueryText": "SELECT ts_millis / 1000.0 AS time, current_crest_factor_l1 AS \"L1 current crest factor\" FROM readings WHERE gateway = '$gateway' AND ts_millis >= $__from AND ts_millis < $__to ORDER BY ts_millis",
+          "queryText": ""
+        }
+      ]
     }
   ]
 }

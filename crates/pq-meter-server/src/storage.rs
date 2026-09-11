@@ -58,7 +58,12 @@ use rusqlite::{Connection, OptionalExtension};
 /// Reading names come off the network; without a cap, a misbehaving or
 /// hostile gateway sending an unbounded variety of field names could grow the
 /// table's schema without limit.
-const MAX_VALUE_COLUMNS: usize = 64;
+///
+/// A single-phase UMG 605-PRO reading already carries 112 value fields (5
+/// base quantities + 7 power-quality scalars + 4 harmonic arrays of 25
+/// orders each), so the cap is set well above that with room for more
+/// harmonics or additional phases.
+const MAX_VALUE_COLUMNS: usize = 256;
 
 /// Column names reserved for `readings`' own bookkeeping; a reading may not
 /// report a value under one of these names.
