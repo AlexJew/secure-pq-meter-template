@@ -16,6 +16,7 @@ use std::{net::IpAddr, path::PathBuf, sync::Arc};
 use anyhow::Context;
 use clap::Parser;
 use pocketscion::util::dev_auth_token;
+use sciparse::address::ip_socket_addr::ScionSocketIpAddr;
 use scion_quic::socket::GenericScionUdpSocket;
 use scion_stack::stack::ScionStackBuilder;
 
@@ -43,6 +44,15 @@ struct Args {
     /// from directly — see `crates/pq-meter-server/TODO.md`.
     #[arg(long, default_value = "data/pqmeter.db")]
     db: PathBuf,
+
+    /// Port the HTTP/3 server's SCION socket binds to. Defaults to
+    /// letting the stack pick an available port, which is fine for a
+    /// single run but changes the printed `--server` address on every
+    /// restart. Pin it to keep that address stable, e.g. when a
+    /// firewall between the gateway and this machine only allows
+    /// specific ports through.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[tokio::main]
@@ -73,8 +83,11 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await
         .context("building the SCION stack of the server")?;
+    let bind_addr = args
+        .port
+        .map(|port| ScionSocketIpAddr::new(network::SERVER_AS, args.bind_ip, port));
     let socket = stack
-        .bind(None)
+        .bind(bind_addr)
         .await
         .context("opening a SCION socket for the server")?;
     let server_address = socket.local_addr();

@@ -99,6 +99,29 @@ impl Umg605ProClient {
         };
         Ok(f32::from_bits(((hi as u32) << 16) | (lo as u32)))
     }
+
+    /// Reads `count` consecutive float32 values starting at `addr` (a `float`
+    /// array in the datasheet's sense, e.g. `_FFT_IL1[0..count]`), in a single
+    /// Modbus request.
+    ///
+    /// Modbus limits a single read to 125 registers, i.e. 62 floats; fails
+    /// without going to the wire if `count` would exceed that, rather than
+    /// letting the server reject an oversized request.
+    pub async fn read_f32_array(&mut self, addr: u16, count: u16) -> Result<Vec<f32>, ReadError> {
+        const MAX_FLOATS_PER_REQUEST: u16 = 62;
+        if count > MAX_FLOATS_PER_REQUEST {
+            return Err(ReadError::DecodeError(Cow::Owned(format!(
+                "requested {count} floats ({} registers) at {addr}, but Modbus allows at most \
+                 125 registers ({MAX_FLOATS_PER_REQUEST} floats) per read",
+                count as u32 * 2,
+            ))));
+        }
+        let regs = self.read_holding_registers(addr, count * 2).await?;
+        Ok(regs
+            .chunks_exact(2)
+            .map(|pair| f32::from_bits(((pair[0] as u32) << 16) | (pair[1] as u32)))
+            .collect())
+    }
 }
 
 
@@ -131,5 +154,76 @@ impl Umg605ProClient {
     /// The UMG 605-PRO does not expose a mean-value register for phase angle.
     pub async fn phase_angle_l1(&mut self) -> Result<f32, ReadError> {
         self.read_f32(3971).await
+    }
+
+    /// Fetches the (vectorial) power factor of phase L1, `_PFLN[0]`.
+    pub async fn power_factor_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(3893).await
+    }
+
+    /// Fetches the total harmonic distortion of the current of phase L1 in
+    /// percent, `_THD_IL[0]`.
+    pub async fn current_thd_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(3813).await
+    }
+
+    /// Fetches the highest positive sampling value of the current of phase L1
+    /// from the last 200ms measuring window, in amperes, `_IL_POS_PEAK[0]`.
+    pub async fn current_peak_positive_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(4059).await
+    }
+
+    /// Fetches the voltage L-N harmonic magnitudes of phase L1, in volts,
+    /// `_FFT_UL1[0..count]` — index 0 is the fundamental (1st harmonic).
+    pub async fn voltage_harmonics_l1(&mut self, count: u16) -> Result<Vec<f32>, ReadError> {
+        self.read_f32_array(391, count).await
+    }
+
+    /// Fetches the voltage L-N harmonic phases of phase L1, `_FFT_ULZ1[0..count]`.
+    ///
+    /// The datasheet's unit column lists "V" for this register, matching its
+    /// magnitude sibling — almost certainly a documentation error for what is
+    /// most likely a phase angle in degrees, but this has not been confirmed
+    /// against the real meter. Treat the unit as provisional until validated
+    /// (see `harmonic-oscilloscope-implementation.md` section 5.3, Checks A-D).
+    pub async fn voltage_phase_harmonics_l1(&mut self, count: u16) -> Result<Vec<f32>, ReadError> {
+        self.read_f32_array(2785, count).await
+    }
+
+    /// Fetches the current harmonic magnitudes of phase L1, in amperes,
+    /// `_FFT_IL1[0..count]` — index 0 is the fundamental (1st harmonic).
+    pub async fn current_harmonics_l1(&mut self, count: u16) -> Result<Vec<f32>, ReadError> {
+        self.read_f32_array(895, count).await
+    }
+
+    /// Fetches the current harmonic phases of phase L1, `_FFT_ILZ1[0..count]`.
+    ///
+    /// Same unverified-unit caveat as [`Self::voltage_phase_harmonics_l1`].
+    pub async fn current_phase_harmonics_l1(&mut self, count: u16) -> Result<Vec<f32>, ReadError> {
+        self.read_f32_array(3289, count).await
+    }
+
+    /// Fetches the sign of the reactive power of phase L1: `+1` inductive,
+    /// `-1` capacitive, `_IND_CAP[0]`.
+    pub async fn power_factor_sign_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(3987).await
+    }
+
+    /// Fetches the fundamental (mains-frequency-only) power factor of phase
+    /// L1, `_COS_PHI[0]`.
+    pub async fn power_factor_fundamental_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(3979).await
+    }
+
+    /// Fetches the highest negative sampling value of the current of phase L1
+    /// from the last 200ms measuring window, in amperes, `_IL_NEG_PEAK[0]`.
+    pub async fn current_peak_negative_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(4043).await
+    }
+
+    /// Fetches the crest factor (peak / RMS) of the current of phase L1,
+    /// `_IL_CF[0]`.
+    pub async fn current_crest_factor_l1(&mut self) -> Result<f32, ReadError> {
+        self.read_f32(4021).await
     }
 }

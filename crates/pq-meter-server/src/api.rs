@@ -222,6 +222,13 @@ async fn tunnel_session(
     let mut next_id: u64 = 1;
     // Bytes of the current gateway message not yet part of a full line.
     let mut pending = bytes::BytesMut::new();
+    // Whether a pull request is still outstanding. The gateway answers one
+    // line per request, so without this a slow round trip (a live meter read
+    // taking longer than `PULL_INTERVAL`, say) would let the ticker queue up
+    // several more requests for the same `last_index` before the first reply
+    // even arrives — each one making the gateway redo a full meter read and
+    // resend its whole backlog for nothing.
+    let mut awaiting_reply = false;
 
     let mut ticker = interval(PULL_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -230,11 +237,12 @@ async fn tunnel_session(
     // interval's first tick is immediate.
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+            _ = ticker.tick(), if !awaiting_reply => {
                 if !send_pull_request(&out, next_id, last_index) {
                     return;
                 }
                 next_id += 1;
+                awaiting_reply = true;
             }
             frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)) => {
                 let Some(Ok(frame)) = frame else {
@@ -246,6 +254,7 @@ async fn tunnel_session(
                 pending.extend_from_slice(&data);
                 while let Some(line) = next_line(&mut pending) {
                     record_data(&line, &gateway, &mut last_index, &store);
+                    awaiting_reply = false;
                 }
             }
         }

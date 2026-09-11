@@ -108,13 +108,13 @@ cargo run -p pq-meter-client -- \
   --meter-ip 192.168.1.50
 ```
 
-The client opens a bidirectional `CONNECT` tunnel and stays connected. Every 5
-seconds the server pulls new measurements through the tunnel; the client
-records one fresh Modbus snapshot in its SQLite database, then answers with
-every stored row after the server's cursor. The server prints each measurement
-and stores them in `data/pqmeter.db`, keyed by gateway identity so a
-reconnect resumes instead of re-sending everything (see
-`crates/pq-meter-server/TODO.md`):
+The client opens a bidirectional `CONNECT` tunnel and stays connected. It
+samples the meter into its own SQLite database every `--interval` (0.2s by
+default, matching the meter's 200ms measuring window) independently of the
+tunnel; every 5 seconds the server separately pulls everything the client has
+stored since its last cursor. The server prints each measurement and stores
+them in `data/pqmeter.db`, keyed by gateway identity so a reconnect resumes
+instead of re-sending everything (see `crates/pq-meter-server/TODO.md`):
 
 ```text
 data tunnel opened by gateway "127.0.0.1:31000"
@@ -202,6 +202,15 @@ automatically within its `updateIntervalSeconds` (10s), no restart needed.
 
 ## Run it between the Pi and the laptop
 
+`scripts/run-pi.sh` automates everything below in one command: it starts the server, cross
+compiles the client, copies it to the Pi over `scp`, and starts it there (`--dummy-meter`
+instead of the real meter with `scripts/run-pi.sh --dummy-meter`). It asks for the Pi's ssh
+password once and reuses that connection for the rest. See the script's own header comment
+for the environment variables it reads (Pi address, meter address, credentials) if your setup
+differs from the defaults in `CLAUDE.md`.
+
+The manual steps it automates:
+
 By default the simulated network is only reachable on the laptop itself. Give the server the
 address of the interface the Pi can reach, for example the WLAN address of the laptop:
 
@@ -229,6 +238,16 @@ from the Pi:
 | 31011 | UDP      | SNAP data plane, gateway AS                          |
 | 31020 | TCP      | SNAP control plane, server AS                        |
 | 31021 | UDP      | SNAP data plane, server AS                           |
+
+The HTTP/3 server itself (the `--server` address printed above, `:59218` in that example) binds
+to a random port that changes on every restart, unless you pin it with `--port`:
+
+```bash
+cargo run -p pq-meter-server -- --bind-ip 192.168.1.42 --port 45000
+```
+
+That keeps the printed `--server` address (and the port a firewall needs to allow) stable across
+restarts, so you don't have to copy a new one into the client command each time.
 
 If the client hangs or reports a connection error, the usual cause is a firewall on the
 laptop that blocks these ports:
