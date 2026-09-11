@@ -6,37 +6,17 @@
 //! reboots and can be copied off the Pi with `scp`, or inspected in place with
 //! `sqlite3 pqmeter.db "SELECT * FROM readings ORDER BY ts_millis DESC LIMIT 10"`.
 //!
-//! Typical use from the meter loop:
-//!
-//! ```ignore
-//! let store = MeterStore::open(Path::new("pqmeter.db"))?;
-//! loop {
-//!     let reading = Reading {
-//!         ts_millis: 0, // overwritten by insert_now
-//!         voltage_l1: client.voltage_l1().await? as f64,
-//!         current_l1: client.current_l1().await? as f64,
-//!         real_power_l1: client.power_l1_n().await? as f64,
-//!         reactive_power_l1: client.reactive_power_l1().await? as f64,
-//!         phase_angle_l1: client.phase_angle_l1().await? as f64,
-//!     };
-//!     store.insert_now(reading)?;
-//! }
-//! ```
+//! [`Reading`] carries its values as an open list of `(name, value)` pairs rather than
+//! fixed fields, mirroring `meter::MeterSnapshot`. The `readings` table's columns are not
+//! fixed either: [`MeterStore::insert`] creates it on the very first call, with one `REAL`
+//! column per name the caller passed in. Every later insert is expected to carry the same
+//! names — in practice one gateway process uses one meter for the lifetime of a database
+//! file, so this only needs to happen once. Mixing meter kinds into the same file is not
+//! supported; point `--db` at a fresh file to switch.
 //!
 //! A consumer that pulls readings incrementally (for example a query endpoint the server
 //! polls) keeps the largest [`StoredReading::id`] it has seen and passes it to
-//! [`MeterStore::since_id`] on the next pull:
-//!
-//! ```ignore
-//! let mut cursor = 0;
-//! loop {
-//!     let batch = store.since_id(cursor, 1_000)?;
-//!     if let Some(last) = batch.last() {
-//!         cursor = last.id;
-//!         send(&batch)?;
-//!     }
-//! }
-//! ```
+//! [`MeterStore::since_id`] on the next pull.
 //!
 //! The connection is not shared: each part of the program that needs the store opens its
 //! own [`MeterStore`] on the same path. SQLite is opened in WAL mode so a writer and a
@@ -46,31 +26,33 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::Connection;
 
 /// One set of measured values, tagged with the moment it was taken.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     /// When the reading was taken, as Unix epoch milliseconds.
     pub ts_millis: i64,
-    /// Voltage of phase L1 to neutral, in volts.
-    pub voltage_l1: f64,
-    /// Current of phase L1, in amperes.
-    pub current_l1: f64,
-    /// Active power of phase L1 to neutral, in watts.
-    pub real_power_l1: f64,
-    /// Reactive power of phase L1, in vars.
-    pub reactive_power_l1: f64,
-    /// Phase angle between voltage and current of phase L1, in degrees.
-    pub phase_angle_l1: f64,
+    /// The measured values, in the order they should be stored and displayed.
+    pub values: Vec<(String, f64)>,
+}
+
+impl Reading {
+    /// The value of one named field, if this reading carries it.
+    pub fn value(&self, name: &str) -> Option<f64> {
+        self.values
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+    }
 }
 
 /// A reading as it is stored, carrying the database id assigned on insert.
 ///
 /// The `id` is strictly increasing in insert order, gap-free in practice, and never
 /// reused. It is the cursor for [`MeterStore::since_id`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredReading {
     /// Row id, assigned by SQLite when the reading was inserted.
     pub id: i64,
@@ -86,8 +68,10 @@ pub struct MeterStore {
 impl MeterStore {
     /// Opens (creating if needed) the readings database at `path`.
     ///
-    /// The `readings` table and its index are created on first use, so pointing this at a
-    /// fresh path and at an existing database both work.
+    /// The `readings` table is not created here — its columns depend on the
+    /// meter writing to it, so it is created by the first [`MeterStore::insert`]
+    /// instead. Pointing this at a fresh path and at an existing database both
+    /// work either way.
     pub fn open(path: &Path) -> Result<Self> {
         Self::from_connection(Connection::open(path)?)
     }
@@ -103,36 +87,29 @@ impl MeterStore {
         // brief overlap from surfacing as an error.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS readings (
-                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                 ts_millis         INTEGER NOT NULL,
-                 voltage_l1        REAL NOT NULL,
-                 current_l1        REAL NOT NULL,
-                 real_power_l1     REAL NOT NULL,
-                 reactive_power_l1 REAL NOT NULL,
-                 phase_angle_l1    REAL NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_readings_ts ON readings (ts_millis);",
-        )?;
         Ok(MeterStore { conn })
     }
 
-    /// Appends one reading.
+    /// Appends one reading, creating the `readings` table first if this is the
+    /// first insert this database file has ever seen.
     pub fn insert(&self, reading: &Reading) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO readings
-                 (ts_millis, voltage_l1, current_l1, real_power_l1, reactive_power_l1, phase_angle_l1)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                reading.ts_millis,
-                reading.voltage_l1,
-                reading.current_l1,
-                reading.real_power_l1,
-                reading.reactive_power_l1,
-                reading.phase_angle_l1,
-            ],
-        )?;
+        self.ensure_table(&reading.values)?;
+        self.check_schema_matches(&reading.values)?;
+
+        let columns: Vec<&str> = reading.values.iter().map(|(name, _)| name.as_str()).collect();
+        let placeholders: Vec<String> = (0..columns.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "INSERT INTO readings (ts_millis, {}) VALUES (?1, {})",
+            columns.join(", "),
+            placeholders.join(", "),
+        );
+
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(reading.values.len() + 1);
+        params.push(&reading.ts_millis);
+        for (_, value) in &reading.values {
+            params.push(value);
+        }
+        self.conn.execute(&sql, params.as_slice())?;
         Ok(())
     }
 
@@ -140,35 +117,24 @@ impl MeterStore {
     ///
     /// The `ts_millis` field of `reading` is ignored.
     pub fn insert_now(&self, mut reading: Reading) -> Result<()> {
-        reading.ts_millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        reading.ts_millis = now_millis();
         self.insert(&reading)
     }
 
     /// Returns every reading with `from_millis <= ts_millis <= to_millis`, oldest first.
     pub fn query(&self, from_millis: i64, to_millis: i64) -> Result<Vec<StoredReading>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, ts_millis, voltage_l1, current_l1, real_power_l1, reactive_power_l1, phase_angle_l1
-             FROM readings
-             WHERE ts_millis BETWEEN ?1 AND ?2
-             ORDER BY ts_millis ASC, id ASC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![from_millis, to_millis], row_to_stored)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.select(
+            "WHERE ts_millis BETWEEN ?1 AND ?2 ORDER BY ts_millis ASC, id ASC",
+            rusqlite::params![from_millis, to_millis],
+        )
     }
 
     /// Returns the `n` most recent readings, newest first.
     pub fn latest(&self, n: usize) -> Result<Vec<StoredReading>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, ts_millis, voltage_l1, current_l1, real_power_l1, reactive_power_l1, phase_angle_l1
-             FROM readings
-             ORDER BY ts_millis DESC, id DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![n as i64], row_to_stored)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.select(
+            "ORDER BY ts_millis DESC, id DESC LIMIT ?1",
+            rusqlite::params![n as i64],
+        )
     }
 
     /// Returns readings with `id` greater than `after_id`, oldest first, at most `limit`.
@@ -177,30 +143,127 @@ impl MeterStore {
     /// row returned. Unlike a time-range query this is immune to clock changes on the Pi
     /// and never returns the same row twice.
     pub fn since_id(&self, after_id: i64, limit: usize) -> Result<Vec<StoredReading>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, ts_millis, voltage_l1, current_l1, real_power_l1, reactive_power_l1, phase_angle_l1
-             FROM readings
-             WHERE id > ?1
-             ORDER BY id ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![after_id, limit as i64], row_to_stored)?;
+        self.select(
+            "WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            rusqlite::params![after_id, limit as i64],
+        )
+    }
+
+    /// Runs one `SELECT ... {clause}` over every value column of the `readings`
+    /// table, in its own column order, and maps each row back to a
+    /// [`StoredReading`]. Returns no rows if the table does not exist yet
+    /// (nothing has been inserted).
+    fn select(&self, clause: &str, params: impl rusqlite::Params) -> Result<Vec<StoredReading>> {
+        let Some(names) = self.value_column_names()? else {
+            return Ok(Vec::new());
+        };
+        let sql = format!("SELECT id, ts_millis, {} FROM readings {clause}", names.join(", "));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params, |row| row_to_stored(row, &names))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The value column names of the `readings` table, in table order, or
+    /// `None` if the table does not exist yet.
+    fn value_column_names(&self) -> Result<Option<Vec<String>>> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(readings)")?;
+        let mut names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if names.is_empty() {
+            return Ok(None);
+        }
+        names.retain(|name| name != "id" && name != "ts_millis");
+        Ok(Some(names))
+    }
+
+    /// Creates the `readings` table with one `REAL` column per name in `values`,
+    /// unless it already exists.
+    fn ensure_table(&self, values: &[(String, f64)]) -> Result<()> {
+        if self.value_column_names()?.is_some() {
+            return Ok(());
+        }
+        for (name, _) in values {
+            validate_column_name(name)?;
+        }
+        let columns = values
+            .iter()
+            .map(|(name, _)| format!("{name} REAL NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn.execute_batch(&format!(
+            "CREATE TABLE readings (
+                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                 ts_millis INTEGER NOT NULL,
+                 {columns}
+             );
+             CREATE INDEX idx_readings_ts ON readings (ts_millis);"
+        ))?;
+        Ok(())
+    }
+
+    /// Fails with a message pointing at the fix if `values`' names don't
+    /// exactly match the `readings` table's existing columns, instead of
+    /// letting `insert` hit SQLite's own "no such column" / "NOT NULL
+    /// constraint failed" errors. The table's schema is fixed for the life of
+    /// a database file (see the module doc comment) — this is expected to
+    /// trigger only when what a meter reports has changed since the file was
+    /// first written.
+    fn check_schema_matches(&self, values: &[(String, f64)]) -> Result<()> {
+        let mut existing = self
+            .value_column_names()?
+            .expect("ensure_table just created the table if it did not already exist");
+        let mut incoming: Vec<String> = values.iter().map(|(name, _)| name.clone()).collect();
+        existing.sort();
+        incoming.sort();
+        if existing == incoming {
+            return Ok(());
+        }
+        bail!(
+            "this reading reports {incoming:?}, but the \"readings\" table already has columns \
+             {existing:?} from an earlier run — a database file's schema is fixed for its \
+             lifetime. Delete this --db file (or point --db at a new one) and restart if what \
+             the meter reports has changed."
+        )
     }
 }
 
-fn row_to_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReading> {
+/// Rejects a reading name that cannot be used as a SQL column name as-is. Names
+/// come from trusted adapter code (`&'static str` literals), not external
+/// input, but a typo here should fail loudly rather than build broken SQL.
+fn validate_column_name(name: &str) -> Result<()> {
+    let starts_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if starts_ok && rest_ok {
+        Ok(())
+    } else {
+        bail!("invalid reading name for a column: {name:?}")
+    }
+}
+
+fn row_to_stored(row: &rusqlite::Row<'_>, names: &[String]) -> rusqlite::Result<StoredReading> {
+    let mut values = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let value: f64 = row.get(2 + i)?;
+        values.push((name.clone(), value));
+    }
     Ok(StoredReading {
         id: row.get(0)?,
         reading: Reading {
             ts_millis: row.get(1)?,
-            voltage_l1: row.get(2)?,
-            current_l1: row.get(3)?,
-            real_power_l1: row.get(4)?,
-            reactive_power_l1: row.get(5)?,
-            phase_angle_l1: row.get(6)?,
+            values,
         },
     })
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -210,11 +273,13 @@ mod tests {
     fn sample(ts_millis: i64) -> Reading {
         Reading {
             ts_millis,
-            voltage_l1: 230.1,
-            current_l1: 1.83,
-            real_power_l1: 420.75,
-            reactive_power_l1: 12.5,
-            phase_angle_l1: 3.2,
+            values: vec![
+                ("voltage_l1_v".to_string(), 230.1),
+                ("current_l1_a".to_string(), 1.83),
+                ("active_power_l1_w".to_string(), 420.75),
+                ("reactive_power_l1_var".to_string(), 12.5),
+                ("phase_angle_l1_deg".to_string(), 3.2),
+            ],
         }
     }
 
@@ -340,6 +405,51 @@ mod tests {
         let got = reopened.query(0, 1_000).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].reading, sample(42));
+    }
+
+    /// The `readings` table's columns follow whatever names the first insert
+    /// carries, not a fixed schema — the whole point of the generic shape.
+    #[test]
+    fn insert_creates_columns_matching_the_first_readings_names() {
+        let store = MeterStore::open_in_memory().unwrap();
+        store
+            .insert(&Reading {
+                ts_millis: 1,
+                values: vec![("frequency_hz".to_string(), 50.01), ("thd_pct".to_string(), 1.2)],
+            })
+            .unwrap();
+
+        let rows = store.latest(1).unwrap();
+        assert_eq!(rows[0].reading.value("frequency_hz"), Some(50.01));
+        assert_eq!(rows[0].reading.value("thd_pct"), Some(1.2));
+    }
+
+    /// A reading whose names don't match an already-established schema fails
+    /// with a message pointing at the fix, not a raw SQLite error.
+    #[test]
+    fn insert_with_mismatched_names_fails_with_an_actionable_message() {
+        let store = MeterStore::open_in_memory().unwrap();
+        store.insert(&sample(1)).unwrap();
+
+        let err = store
+            .insert(&Reading {
+                ts_millis: 2,
+                values: vec![("frequency_hz".to_string(), 50.0)],
+            })
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("--db"), "message was: {message}");
+    }
+
+    /// Reading with nothing inserted yet returns no rows instead of a SQL
+    /// error about a missing table.
+    #[test]
+    fn reads_on_an_empty_store_return_no_rows() {
+        let store = MeterStore::open_in_memory().unwrap();
+        assert_eq!(store.latest(10).unwrap(), vec![]);
+        assert_eq!(store.since_id(0, 10).unwrap(), vec![]);
+        assert_eq!(store.query(0, i64::MAX).unwrap(), vec![]);
     }
 
     fn now_millis() -> i64 {

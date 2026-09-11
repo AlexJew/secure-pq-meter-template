@@ -12,8 +12,8 @@
 //! everything after a given row id — as a table or as JSON lines.
 //!
 //! The meter itself is read through the [`meter::MeterSource`] trait; `main`
-//! wires in [`meter::ModbusMeter`], or [`meter::DummyMeter`] when `--dummy-meter`
-//! is passed (see `scripts/run-dummy.sh --live`).
+//! wires in [`meter::umg605::ModbusMeter`], or [`meter::dummy::DummyMeter`] when
+//! `--dummy-meter` is passed (see `scripts/run-dummy.sh --live`).
 
 mod meter;
 // `show` uses most of `storage`; `query` (time-range reads) is exercised only
@@ -214,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
 /// Polls the physical meter and persists every successful reading locally.
 async fn record(args: RecordArgs) -> anyhow::Result<()> {
     let meter_addr = SocketAddr::new(args.meter_ip, args.meter_port);
-    let mut meter = meter::ModbusMeter::connect(
+    let mut meter = meter::umg605::ModbusMeter::connect(
         meter_addr,
         args.meter_unit,
         Duration::from_secs(args.meter_timeout_secs),
@@ -224,21 +224,30 @@ async fn record(args: RecordArgs) -> anyhow::Result<()> {
     let store = MeterStore::open(&args.db)
         .with_context(|| format!("opening the database at {}", args.db.display()))?;
     let interval = Duration::from_secs_f64(args.interval);
-    tracing::info!(meter = %meter_addr, database = %args.db.display(), ?interval, "recording meter readings");
+    tracing::info!(
+        meter = %meter_addr,
+        kind = meter.kind(),
+        database = %args.db.display(),
+        ?interval,
+        "recording meter readings"
+    );
 
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
         match meter.read_snapshot().await {
-            Ok(snapshot) => match store.insert_now(snapshot.into()) {
-                Ok(()) => tracing::info!(
-                    voltage_l1_v = snapshot.voltage_l1_v,
-                    current_l1_a = snapshot.current_l1_a,
-                    active_power_l1_w = snapshot.active_power_l1_w,
-                    "stored meter reading"
-                ),
-                Err(err) => tracing::warn!(error = ?err, "failed to persist meter reading"),
-            },
+            Ok(snapshot) => {
+                let readings = snapshot
+                    .readings
+                    .iter()
+                    .map(|r| format!("{}={:.2}", r.name, r.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match store.insert_now(snapshot.into()) {
+                    Ok(()) => tracing::info!(%readings, "stored meter reading"),
+                    Err(err) => tracing::warn!(error = ?err, "failed to persist meter reading"),
+                }
+            }
             Err(err) => tracing::warn!(error = ?err, "failed to read the meter"),
         }
     }
@@ -266,11 +275,11 @@ async fn run(args: TunnelArgs) -> anyhow::Result<()> {
     let store = MeterStore::open(&args.db)
         .with_context(|| format!("opening the database at {}", args.db.display()))?;
     let meter: Box<dyn MeterSource> = if args.dummy_meter {
-        Box::new(meter::DummyMeter::new())
+        Box::new(meter::dummy::DummyMeter::new())
     } else {
         // `required_unless_present = "dummy_meter"` guarantees this is `Some`.
         let meter_addr = SocketAddr::new(args.meter_ip.unwrap(), args.meter_port);
-        let modbus_meter = meter::ModbusMeter::connect(
+        let modbus_meter = meter::umg605::ModbusMeter::connect(
             meter_addr,
             args.meter_unit,
             Duration::from_secs(args.meter_timeout_secs),
@@ -279,11 +288,12 @@ async fn run(args: TunnelArgs) -> anyhow::Result<()> {
         .with_context(|| format!("connecting to the Modbus meter at {meter_addr}"))?;
         Box::new(modbus_meter)
     };
+    let meter_kind = meter.kind();
     let mut gateway = Gateway { meter, store };
 
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        tracing::info!(server = %args.server, "opening tunnel");
+        tracing::info!(server = %args.server, kind = meter_kind, "opening tunnel");
         match run_tunnel(&client, &authority, &mut gateway).await {
             Ok(()) => {
                 tracing::info!("tunnel closed, reconnecting");
@@ -492,38 +502,45 @@ fn row_json(row: &StoredReading) -> String {
 /// Renders a stored reading in the wire format, using its SQLite row id as
 /// the incremental response cursor.
 fn stored_reading_json(row: &StoredReading) -> Value {
-    json!({
-        "id": row.id,
-        "timestamp": row.reading.ts_millis.to_string(),
-        "voltage_l1_v": row.reading.voltage_l1,
-        "current_l1_a": row.reading.current_l1,
-        "active_power_l1_w": row.reading.real_power_l1,
-        "reactive_power_l1_var": row.reading.reactive_power_l1,
-        "phase_angle_l1_deg": row.reading.phase_angle_l1,
-        "index": row.id,
-    })
+    let mut object = serde_json::Map::with_capacity(row.reading.values.len() + 3);
+    object.insert("id".to_string(), json!(row.id));
+    object.insert("timestamp".to_string(), json!(row.reading.ts_millis.to_string()));
+    for (name, value) in &row.reading.values {
+        object.insert(name.clone(), json!(value));
+    }
+    object.insert("index".to_string(), json!(row.id));
+    Value::Object(object)
 }
 
+/// Prints one row per reading, with one column per value name. Every row is
+/// expected to carry the same names (one database file holds one meter kind),
+/// so the header is taken from the first row.
 fn print_table(rows: &[StoredReading]) {
-    println!(
-        "{:>8}  {:<19}  {:>8}  {:>7}  {:>9}  {:>9}  {:>7}",
-        "id", "time (UTC)", "V L1", "A L1", "W L1", "var L1", "deg L1"
-    );
+    let Some(names) = rows.first().map(|row| {
+        row.reading
+            .values
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+
+    print!("{:>8}  {:<19}", "id", "time (UTC)");
+    for name in &names {
+        print!("  {name:>14}");
+    }
+    println!();
+
     for row in rows {
-        let r = &row.reading;
-        let time = chrono::DateTime::from_timestamp_millis(r.ts_millis)
+        let time = chrono::DateTime::from_timestamp_millis(row.reading.ts_millis)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| r.ts_millis.to_string());
-        println!(
-            "{:>8}  {:<19}  {:>8.2}  {:>7.2}  {:>9.2}  {:>9.2}  {:>7.2}",
-            row.id,
-            time,
-            r.voltage_l1,
-            r.current_l1,
-            r.real_power_l1,
-            r.reactive_power_l1,
-            r.phase_angle_l1
-        );
+            .unwrap_or_else(|| row.reading.ts_millis.to_string());
+        print!("{:>8}  {:<19}", row.id, time);
+        for (_, value) in &row.reading.values {
+            print!("  {value:>14.2}");
+        }
+        println!();
     }
 }
 
@@ -533,11 +550,11 @@ impl From<meter::MeterSnapshot> for storage::Reading {
     fn from(snapshot: meter::MeterSnapshot) -> Self {
         storage::Reading {
             ts_millis: 0,
-            voltage_l1: snapshot.voltage_l1_v,
-            current_l1: snapshot.current_l1_a,
-            real_power_l1: snapshot.active_power_l1_w,
-            reactive_power_l1: snapshot.reactive_power_l1_var,
-            phase_angle_l1: snapshot.phase_angle_l1_deg,
+            values: snapshot
+                .readings
+                .into_iter()
+                .map(|r| (r.name.to_string(), r.value))
+                .collect(),
         }
     }
 }
@@ -551,7 +568,7 @@ mod tests {
 
     fn test_gateway() -> Gateway {
         Gateway {
-            meter: Box::new(meter::DummyMeter::new()),
+            meter: Box::new(meter::dummy::DummyMeter::new()),
             store: MeterStore::open(std::path::Path::new(":memory:")).expect("in-memory store"),
         }
     }
@@ -620,24 +637,14 @@ mod tests {
 
         let stored = gateway.store.latest(10).unwrap();
         assert_eq!(stored.len(), 1);
-        assert!(stored[0].reading.voltage_l1 > 0.0);
+        assert!(stored[0].reading.value("voltage_l1_v").unwrap() > 0.0);
     }
 
     #[tokio::test]
     async fn data_request_returns_only_rows_after_its_index() {
         let mut gateway = test_gateway();
         for ts in [100, 200, 300] {
-            gateway
-                .store
-                .insert(&storage::Reading {
-                    ts_millis: ts,
-                    voltage_l1: 230.0,
-                    current_l1: 5.0,
-                    real_power_l1: 1_150.0,
-                    reactive_power_l1: 60.0,
-                    phase_angle_l1: 3.0,
-                })
-                .unwrap();
+            gateway.store.insert(&sample(ts)).unwrap();
         }
         let input = ndjson(&[json!({"type": "data", "id": 1, "payload": {"index": 1}})]);
         let (_, replies) = serve_input(&mut gateway, &input).await;
@@ -692,6 +699,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MeterSource for BrokenMeter {
+        fn kind(&self) -> &'static str {
+            "broken"
+        }
+
         async fn read_snapshot(&mut self) -> anyhow::Result<MeterSnapshot> {
             anyhow::bail!("meter did not respond")
         }
@@ -845,7 +856,7 @@ mod tests {
         let path = dir.path().join("pqmeter.db");
         let store = MeterStore::open(&path).unwrap();
         for _ in 0..5 {
-            store.insert_now(sample()).unwrap();
+            store.insert_now(sample(0)).unwrap();
         }
 
         let args = ShowArgs {
@@ -870,7 +881,7 @@ mod tests {
         let path = dir.path().join("pqmeter.db");
         let store = MeterStore::open(&path).unwrap();
         for _ in 0..5 {
-            store.insert_now(sample()).unwrap();
+            store.insert_now(sample(0)).unwrap();
         }
 
         let args = ShowArgs {
@@ -889,14 +900,16 @@ mod tests {
         assert_eq!(ids, vec![5, 4]);
     }
 
-    fn sample() -> storage::Reading {
+    fn sample(ts_millis: i64) -> storage::Reading {
         storage::Reading {
-            ts_millis: 0,
-            voltage_l1: 230.0,
-            current_l1: 1.8,
-            real_power_l1: 414.0,
-            reactive_power_l1: 12.0,
-            phase_angle_l1: 3.0,
+            ts_millis,
+            values: vec![
+                ("voltage_l1_v".to_string(), 230.0),
+                ("current_l1_a".to_string(), 1.8),
+                ("active_power_l1_w".to_string(), 414.0),
+                ("reactive_power_l1_var".to_string(), 12.0),
+                ("phase_angle_l1_deg".to_string(), 3.0),
+            ],
         }
     }
 }

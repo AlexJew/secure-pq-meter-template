@@ -25,7 +25,8 @@ crates/
     src/api.rs             The HTTP/3 endpoint; serves CONNECT data tunnels and a POST route
   pq-meter-client/         Runs on the gateway
     src/main.rs            Maintains the CONNECT tunnel, records and serves readings
-    src/meter.rs           The MeterSource trait and the Modbus-backed meter implementation
+    src/meter/mod.rs       The MeterSource trait, generic across meter types
+    src/meter/umg605.rs    The Modbus-backed UMG 605-PRO implementation
   umg605-modbus-client/    Reads data from a UMG 605-PRO power quality meter over Modbus TCP
     src/lib.rs             The Modbus TCP client and the registers it reads
     bin/pinger.rs          Example binary that reads values from the meter
@@ -126,7 +127,7 @@ different on every start, so take the address from the output rather than from t
 ## Run against dummy meter data
 
 `pq-meter-client` reads the meter through the `meter::MeterSource` trait
-(`crates/pq-meter-client/src/meter.rs`); today `main` wires in a `DummyMeter` that produces
+(`crates/pq-meter-client/src/meter/mod.rs`); today `main` wires in a `DummyMeter` that produces
 plausible, slowly drifting readings with no hardware attached. `scripts/run-dummy.sh` exercises
 this:
 
@@ -225,7 +226,7 @@ interval and appends each one, with a timestamp, to a local SQLite file:
 
 ```text
 recording 192.168.1.50:502 to pqmeter.db every 1.00s
-stored: 230.12 V, 1.83 A, 420.75 W, 12.50 var, 3.20 deg
+stored meter reading readings="voltage_l1_v=230.12, current_l1_a=1.83, active_power_l1_w=420.75, reactive_power_l1_var=12.50, phase_angle_l1_deg=3.20"
 ```
 
 A read that fails (a meter blip, a timeout) is logged and skipped; the loop keeps going.
@@ -244,9 +245,12 @@ installing anything:
 ```
 
 ```text
-      id  time (UTC)               V L1     A L1       W L1     var L1   deg L1
-       3  2026-09-10 15:53:02    230.12     1.83     420.75      12.50     3.20
+      id  time (UTC)             voltage_l1_v    current_l1_a  active_power_l1_w  reactive_power_l1_var  phase_angle_l1_deg
+       3  2026-09-10 15:53:02          230.12            1.83             420.75                  12.50                3.20
 ```
+
+Column headers come from whatever names the meter reports (see "Where to continue" below) —
+they are not fixed to the UMG 605-PRO's five L1 values.
 
 `--since-id` is the cursor for an incremental consumer (a query endpoint the server polls):
 keep the largest `id` you have seen and pass it next time. That endpoint is not built yet.
@@ -362,8 +366,10 @@ cargo cross build --release -p umg605-modbus-client --bin pinger --target aarch6
 ## Where to continue
 
 * **Read the meter.** `pq-meter-client` reads through the `meter::MeterSource` trait
-  (`crates/pq-meter-client/src/meter.rs`), using a connected `Umg605ProClient` to collect the
-  L1 values. Check the meter with the `pinger` [first](#read-from-the-meter).
+  (`crates/pq-meter-client/src/meter/mod.rs`); `meter/umg605.rs` uses a connected
+  `Umg605ProClient` to collect the L1 values. Check the meter with the `pinger`
+  [first](#read-from-the-meter). A different meter vendor or model is a sibling module
+  implementing the same trait — see `crates/pq-meter-client/METER_ADAPTER.md`.
 * **Send your own data.** The client returns stored SQLite rows from `handle_line()` in
   `crates/pq-meter-client/src/main.rs`, using SQLite row IDs as the incremental protocol index.
 * **Receive your own data.** The server's `tunnel_session()` in `crates/pq-meter-server/src/api.rs`

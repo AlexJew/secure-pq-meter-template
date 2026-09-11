@@ -4,31 +4,44 @@
 
 `pq-meter-client` needs to read a meter every time the server sends a `"data"`
 request (see `CONNECT_PROTOCOL.md`). This document describes the seam that
-separates "how a request is answered" from "where the numbers come from", and
-the dummy implementation behind it that lets the client be built, run, and
-tested without a UMG 605-PRO attached.
+separates "how a request is answered" from "where the numbers come from", the
+dummy implementation behind it that lets the client be built, run, and tested
+without a UMG 605-PRO attached, and how a second meter vendor or model would
+plug into the same seam.
 
 ## The `MeterSource` trait
 
-Defined in `crates/pq-meter-client/src/meter.rs`:
+Defined in `crates/pq-meter-client/src/meter/mod.rs`:
 
 ```rust
+pub struct Reading {
+    pub name: &'static str,
+    pub value: f64,
+}
+
 pub struct MeterSnapshot {
-    pub voltage_l1_v: f64,
-    pub current_l1_a: f64,
-    pub active_power_l1_w: f64,
-    pub reactive_power_l1_var: f64,
-    pub phase_angle_l1_deg: f64,
+    pub readings: Vec<Reading>,
 }
 
 #[async_trait::async_trait]
 pub trait MeterSource: Send {
+    fn kind(&self) -> &'static str;
     async fn read_snapshot(&mut self) -> anyhow::Result<MeterSnapshot>;
 }
 ```
 
 Design points:
 
+- **`MeterSnapshot` is an open, ordered list of named readings, not fixed fields.** A meter
+  reports whatever quantities it has; this type, `storage.rs`, and the wire protocol all follow
+  that shape without needing to change when a second vendor is added — see "Adding a second
+  meter type" below. `name` doubles as the wire field name; per `CONNECT_PROTOCOL.md`'s
+  convention the unit is already encoded in it (e.g. `"voltage_l1_v"`), so there is no separate
+  unit type.
+- **`kind()`.** A short, stable identifier (`"umg605-pro"`, `"dummy"`) carried in logs, so more
+  than one meter type can be told apart once there is more than one. It does not affect
+  storage: only one meter runs per gateway process, so `storage.rs` derives its schema from
+  whatever `read_snapshot` actually returns rather than routing on `kind()`.
 - **`&mut self`.** The real UMG 605-PRO client (`umg605_modbus_client::Umg605ProClient`)
   reads over a Modbus TCP connection, and every one of its read methods (`voltage_l1`,
   `current_l1`, `power_l1_n`, `reactive_power_l1`, `phase_angle_l1`) takes `&mut self`. Matching
@@ -49,19 +62,43 @@ Design points:
   peer is instead served from the client's own persisted history (see "Wiring into the client"
   below), not by re-querying the meter.
 
-`MeterSnapshot::to_json(self, index)` renders one snapshot in the wire shape, stamping it with
-a caller-supplied index and the current time. It's exercised directly by a `meter.rs` test
+`MeterSnapshot::to_json(&self, index)` renders one snapshot in the wire shape, stamping it with
+a caller-supplied index and the current time. It's exercised directly by a `meter/mod.rs` test
 (see "Tests" below) to pin down the wire field names, but the live reply path does not call it:
 once a snapshot is persisted, the reply is built from stored rows by `stored_reading_json` in
 `main.rs` (see below), whose `index` is the SQLite row id rather than a value `to_json` stamps
 itself.
 
+## Module layout
+
+```
+crates/pq-meter-client/src/meter/
+  mod.rs      MeterSource, Reading, MeterSnapshot — vendor-agnostic
+  dummy.rs    DummyMeter — no hardware, for demos and tests
+  umg605.rs   ModbusMeter — the only module that imports umg605_modbus_client
+```
+
+`meter/mod.rs` owns only the trait and its shared types; each meter implementation is a sibling
+module. `dummy.rs` and `umg605.rs` both implement `MeterSource` the same way a third vendor
+would, so the two are the working example of the seam described below. `meter/mod.rs` never
+imports `umg605_modbus_client`; only `meter/umg605.rs` does.
+
 ## `DummyMeter`
 
-A `MeterSource` for demos and tests, alongside the real `ModbusMeter` (see below). Each call to
-`read_snapshot` returns plausible values (230V, 5A, ~1150W, etc.) perturbed by a deterministic
-sine-based jitter keyed on a read counter, so consecutive readings visibly differ without
-needing real entropy or state beyond a `u64`.
+A `MeterSource` for demos and tests, alongside the real `ModbusMeter` (see below). Defined in
+`meter/dummy.rs`. Each call to `read_snapshot` returns plausible values (230V, 5A, ~1150W, etc.)
+perturbed by a deterministic sine-based jitter keyed on a read counter, so consecutive readings
+visibly differ without needing real entropy or state beyond a `u64`.
+
+## Adding a second meter type
+
+Add a sibling module, `meter/other_vendor.rs`, with its own struct implementing `MeterSource`:
+`kind()` returns a new identifier, `read_snapshot` returns a `MeterSnapshot` whose `readings`
+list names whatever that device reports. Nothing in `meter/mod.rs`, `storage.rs`, or the wire
+protocol changes — `storage.rs` creates its `readings` table from the first snapshot's names on
+first insert (see its own doc comment), so a different meter reporting different quantities
+just gets a table matching them, in a fresh `--db` file. `main.rs` wires it in wherever it
+currently constructs a `Box<dyn MeterSource>`.
 
 ## Wiring into the client
 
@@ -100,15 +137,19 @@ The request-handling code is split so the protocol logic is independent of the t
 ## Local persistence (`storage.rs`) and `show`
 
 Every reading the tunnel answers is also appended to a SQLite file via `MeterStore`
-(`crates/pq-meter-client/src/storage.rs`) — its own module, independent of both `meter.rs` and
+(`crates/pq-meter-client/src/storage.rs`) — its own module, independent of both `meter/` and
 the tunnel logic. It stores rows keyed by an auto-incrementing id and a millisecond timestamp,
 in WAL mode so a concurrent reader (like `show`, below) doesn't block the writer.
 
-`MeterSnapshot` and `storage::Reading` are deliberately two separate types (`meter.rs` doesn't
-know about SQLite; `storage.rs` doesn't know about the wire protocol) bridged by one `impl
-From<MeterSnapshot> for Reading` in `main.rs`. The reverse direction — a stored row back to wire
-JSON — is `stored_reading_json` in `main.rs`, used both by the tunnel's `"data"` replies and by
-`show --json`, so the two never drift apart.
+`MeterSnapshot` (`meter/mod.rs`) and `storage::Reading` are deliberately two separate types —
+`meter/` doesn't know about SQLite; `storage.rs` doesn't know about the wire protocol — bridged
+by one `impl From<MeterSnapshot> for Reading` in `main.rs`. Both carry the same shape, an open
+list of named values, so the bridge is a straight copy; `storage.rs` creates the `readings`
+table's columns from those names on the first insert rather than assuming a fixed schema (see
+its own doc comment), which is what lets a second meter type use the same storage code
+unchanged. The reverse direction — a stored row back to wire JSON — is `stored_reading_json` in
+`main.rs`, used both by the tunnel's `"data"` replies and by `show --json`, so the two never
+drift apart.
 
 `pq-meter-client show` reads that file back without touching the network:
 
@@ -127,10 +168,12 @@ that the two don't mix).
 
 `cargo test -p pq-meter-client` runs entirely without a network or a meter:
 
-- `meter.rs` tests check that `DummyMeter` produces varying, plausible values and that
-  `to_json` carries the right wire fields.
+- `meter/dummy.rs` tests check that `DummyMeter` produces varying, plausible values; a
+  `meter/mod.rs` test checks that `to_json` carries the right wire fields.
 - `storage.rs` tests check `MeterStore` directly: insert/query round-trips, ordering, the
-  `since_id` cursor, and that a file-backed store survives being reopened.
+  `since_id` cursor, that a file-backed store survives being reopened, that the `readings` table
+  picks up whatever column names the first insert carries, and that reading before any insert
+  returns no rows instead of a SQL error.
 - `main.rs` tests drive `serve_tunnel` over `tokio::io::duplex()` with an in-memory
   (`":memory:"`) `MeterStore`, asserting: a `"data"` request gets a matching-id `"data"` reply
   with a `voltage_l1_v` field and is also persisted to the store; a request whose `payload.index`
@@ -160,9 +203,9 @@ the server pulling and printing dummy measurements from the client every few sec
 
 ## The real meter (`ModbusMeter`) and `--dummy-meter`
 
-`main` wires in [`meter::ModbusMeter`], which connects to a real UMG 605-PRO over Modbus TCP at
+`main` wires in [`meter::umg605::ModbusMeter`], which connects to a real UMG 605-PRO over Modbus TCP at
 startup using `--meter-ip`/`--meter-port`/`--meter-unit`/`--meter-timeout-secs`. Passing
-`--dummy-meter` instead skips that connection and wires in [`meter::DummyMeter`] — plausible,
+`--dummy-meter` instead skips that connection and wires in [`meter::dummy::DummyMeter`] — plausible,
 drifting values with no hardware required, for demos and `scripts/run-dummy.sh --live`.
 `--meter-ip` and `--dummy-meter` are mutually exclusive, and clap requires exactly one of them
 to be given.
