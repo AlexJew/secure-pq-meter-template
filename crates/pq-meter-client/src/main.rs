@@ -130,6 +130,12 @@ struct TunnelArgs {
     /// pass this explicitly in a real deployment.
     #[arg(long)]
     gateway_id: Option<String>,
+
+    /// Number of seconds between local meter reads, independent of the
+    /// server's own pull cadence. Defaults to the meter's own 200ms
+    /// measuring-window update rate, same as `record`'s default.
+    #[arg(long, default_value_t = 0.2, value_parser = parse_positive_seconds)]
+    interval: f64,
 }
 
 /// Arguments for recording meter readings without a SCION connection.
@@ -248,21 +254,28 @@ async fn record(args: RecordArgs) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
-        match meter.read_snapshot().await {
-            Ok(snapshot) => {
-                let readings = snapshot
-                    .readings
-                    .iter()
-                    .map(|r| format!("{}={:.2}", r.name, r.value))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                match store.insert_now(snapshot.into()) {
-                    Ok(()) => tracing::info!(%readings, "stored meter reading"),
-                    Err(err) => tracing::warn!(error = ?err, "failed to persist meter reading"),
-                }
+        sample_once(&mut meter, &store).await;
+    }
+}
+
+/// Reads one meter snapshot and appends it to `store`, logging success or
+/// failure. Shared by [`record`]'s own ticker and [`serve_tunnel`]'s local
+/// sampling ticker, which both need identical read-log-persist behaviour.
+async fn sample_once(meter: &mut dyn MeterSource, store: &MeterStore) {
+    match meter.read_snapshot().await {
+        Ok(snapshot) => {
+            let readings = snapshot
+                .readings
+                .iter()
+                .map(|r| format!("{}={:.2}", r.name, r.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            match store.insert_now(snapshot.into()) {
+                Ok(()) => tracing::info!(%readings, "stored meter reading"),
+                Err(err) => tracing::warn!(error = ?err, "failed to persist meter reading"),
             }
-            Err(err) => tracing::warn!(error = ?err, "failed to read the meter"),
         }
+        Err(err) => tracing::warn!(error = ?err, "failed to read the meter"),
     }
 }
 
@@ -316,10 +329,11 @@ async fn run(args: TunnelArgs) -> anyhow::Result<()> {
         )
     });
 
+    let interval = Duration::from_secs_f64(args.interval);
     let mut backoff = INITIAL_BACKOFF;
     loop {
         tracing::info!(server = %args.server, kind = meter_kind, gateway_id = %gateway_id, "opening tunnel");
-        match run_tunnel(&client, &authority, &gateway_id, &mut gateway).await {
+        match run_tunnel(&client, &authority, &gateway_id, &mut gateway, interval).await {
             Ok(()) => {
                 tracing::info!("tunnel closed, reconnecting");
                 backoff = INITIAL_BACKOFF;
@@ -354,6 +368,7 @@ async fn run_tunnel(
     authority: &str,
     gateway_id: &str,
     gateway: &mut Gateway,
+    interval: Duration,
 ) -> anyhow::Result<()> {
     let request = http::Request::builder()
         .method(http::Method::CONNECT)
@@ -374,39 +389,53 @@ async fn run_tunnel(
     );
 
     let stream = H3DuplexStream::new(writer, response.into_body());
-    serve_tunnel(stream, gateway).await
+    serve_tunnel(stream, gateway, interval).await
 }
 
 /// Frames NDJSON off `stream` and answers each message, until the peer closes
 /// its write half or a framing error closes the tunnel. Generic over the byte
 /// stream so it can be driven over an in-memory pipe in tests, with no network.
-async fn serve_tunnel<S>(mut stream: S, gateway: &mut Gateway) -> anyhow::Result<()>
+///
+/// Concurrently samples the meter into the local store every `interval`,
+/// independent of the server's own pull cadence (`PULL_INTERVAL` in
+/// `pq-meter-server`'s `api` module) — a slow puller should not thin out the
+/// local history a fast-changing meter deserves.
+async fn serve_tunnel<S>(mut stream: S, gateway: &mut Gateway, interval: Duration) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    // Unlike `tokio::time::interval`, does not fire immediately: a `data`
+    // request typically arrives well before the first interval elapses
+    // anyway, so an immediate sample here would just be a redundant read
+    // right as the tunnel opens.
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
 
     loop {
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .context("reading from the tunnel")?;
-        if n == 0 {
-            return Ok(());
-        }
-        buf.extend_from_slice(&chunk[..n]);
+        tokio::select! {
+            _ = ticker.tick() => {
+                sample_once(gateway.meter.as_mut(), &gateway.store).await;
+            }
+            result = stream.read(&mut chunk) => {
+                let n = result.context("reading from the tunnel")?;
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.extend_from_slice(&chunk[..n]);
 
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line = buf[..pos].to_vec();
-            buf.drain(..=pos);
-            handle_line(&mut stream, &line, gateway).await?;
-        }
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line = buf[..pos].to_vec();
+                    buf.drain(..=pos);
+                    handle_line(&mut stream, &line, gateway).await?;
+                }
 
-        anyhow::ensure!(
-            buf.len() <= MAX_LINE_SIZE,
-            "line exceeds {MAX_LINE_SIZE} bytes without a delimiter"
-        );
+                anyhow::ensure!(
+                    buf.len() <= MAX_LINE_SIZE,
+                    "line exceeds {MAX_LINE_SIZE} bytes without a delimiter"
+                );
+            }
+        }
     }
 }
 
@@ -634,7 +663,9 @@ mod tests {
         peer.write_all(input).await.unwrap();
         peer.shutdown().await.unwrap();
 
-        let result = serve_tunnel(tunnel, gateway).await;
+        // Long enough that the local sampling ticker never fires before the
+        // test's own input is drained and EOF closes the loop.
+        let result = serve_tunnel(tunnel, gateway, Duration::from_secs(3600)).await;
 
         let mut replies = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut peer, &mut replies)
@@ -648,6 +679,28 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn local_ticker_samples_independently_of_data_requests() {
+        let mut gateway = test_gateway();
+        // Kept alive (not `_`) and never shut down or written to, so the
+        // tunnel read side just stays pending — only the ticker can make
+        // progress.
+        let (_peer, tunnel) = tokio::io::duplex(4 * MAX_LINE_SIZE);
+
+        tokio::select! {
+            result = serve_tunnel(tunnel, &mut gateway, Duration::from_millis(20)) => {
+                panic!("serve_tunnel should not exit on its own: {result:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+
+        let stored = gateway.store.latest(10).unwrap();
+        assert!(
+            !stored.is_empty(),
+            "the local ticker should have sampled the meter without any data request"
+        );
     }
 
     #[tokio::test]
