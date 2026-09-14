@@ -21,6 +21,21 @@
 # NGROK_DOMAIN set too, that URL is randomly assigned on every start; set it
 # to your account's free static domain (Domains section of the ngrok
 # dashboard, looks like your-name.ngrok-free.app) for a stable one instead.
+#
+# The Angular dashboard (web/) is an alternative to Grafana above, built and
+# served as a static site (see web/Dockerfile) rather than run through
+# `ng serve` — reads the same live data (pq-meter-server's plain-HTTP API on
+# the host, port 31030) through web/nginx.conf's reverse proxy. It's a
+# separate opt-in profile, not a replacement for the `grafana` service
+# above, so plain `docker compose up -d` is unchanged:
+#   docker compose --profile dashboard up -d
+#   open http://localhost:8080
+# Sharing it works the same way as Grafana's, just under its own profile,
+# port, and env vars so both can run side by side:
+#   docker compose --profile share-dashboard up -d
+# (public URL: `docker compose logs ngrok-dashboard`, or the inspection
+# dashboard at http://localhost:4041; NGROK_DASHBOARD_DOMAIN for a stable
+# domain, same idea as NGROK_DOMAIN above.)
 services:
   grafana:
     image: grafana/grafana-oss:13.0.2
@@ -76,6 +91,39 @@ services:
       - '4040:4040'
     depends_on:
       - grafana
+
+  # Opt-in (see the "Angular dashboard" note above): the Angular dashboard,
+  # built and served as a static site rather than run through `ng serve`.
+  dashboard:
+    build:
+      context: ./web
+    restart: unless-stopped
+    profiles: [dashboard, share-dashboard]
+    ports:
+      - '8080:80'
+    extra_hosts:
+      # Reaches pq-meter-server's web API on the host (see web/nginx.conf).
+      # Docker Desktop (macOS/Windows) already resolves host.docker.internal
+      # without this; Linux needs it added explicitly.
+      - 'host.docker.internal:host-gateway'
+
+  # Opt-in: exposes `dashboard` at a public ngrok URL, the same way `ngrok`
+  # above does for `grafana` — kept as a separate service/profile so sharing
+  # one doesn't require running (or exposing) the other.
+  ngrok-dashboard:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    profiles: [share-dashboard]
+    entrypoint: ['sh', '-c']
+    command: ['ngrok http dashboard:80${NGROK_DASHBOARD_DOMAIN:+ --url $NGROK_DASHBOARD_DOMAIN}']
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    ports:
+      # Not 4040: that's already claimed by the `ngrok` service above, and
+      # both may run at once (e.g. --profile share --profile share-dashboard).
+      - '4041:4040'
+    depends_on:
+      - dashboard
 
 volumes:
   grafana_storage: {}

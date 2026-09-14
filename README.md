@@ -24,6 +24,7 @@ crates/
     src/network.rs         The simulated SCION network (which ASes, which addresses)
     src/api.rs             The HTTP/3 endpoint; serves CONNECT data tunnels and a POST route
     src/storage.rs         The durable, per-gateway SQLite store received data lands in
+    src/web_api.rs         Plain-HTTP data API the Angular dashboard (web/) reads
   pq-meter-client/         Runs on the gateway
     src/main.rs            Maintains the CONNECT tunnel, records and serves readings
     src/meter/mod.rs       The MeterSource trait, generic across meter types
@@ -33,9 +34,12 @@ crates/
     src/lib.rs             The Modbus TCP client and the registers it reads
     bin/pinger.rs          Example binary that reads values from the meter
 grafana/                   Datasource and dashboard provisioned into the Grafana container below
+web/                       Angular dashboard; reads pq-meter-server's src/web_api.rs
+  Dockerfile               Builds web/ and serves it via nginx, for docker-compose.yml
 Cargo.toml                 Workspace, pins the SCION SDK version
 rust-toolchain.toml        Rust version used to build this repository
-docker-compose.yml         Runs Grafana against the server's SQLite file, see below
+docker-compose.yml         Runs Grafana (and, opt-in, the Angular dashboard) against the
+                            server's SQLite file / web API, see below
 scripts/run-dummy.sh       Runs the client against its dummy meter, see below
 ```
 
@@ -145,6 +149,8 @@ scripts/run-dummy.sh --live         # starts pq-meter-server, scrapes its addres
 scripts/run-dummy.sh --live --web   # the above, plus the Angular dashboard (`web/`) at
                                      # http://localhost:4200, reading live data through its
                                      # dev proxy (installs `web/node_modules` first if missing).
+scripts/run-dummy.sh --live --skip-build   # the above, without rebuilding first -- reuses
+                                     # the binaries from the last build (fails if there isn't one).
 ```
 
 See `crates/pq-meter-client/METER_ADAPTER.md` for how the `MeterSource` trait, `DummyMeter`,
@@ -203,14 +209,85 @@ time range back down (e.g. to the last hour) — edit `time` in
 `grafana/dashboards/pq-meter.json`, which the running container picks up
 automatically within its `updateIntervalSeconds` (10s), no restart needed.
 
+## The Angular dashboard as a static site
+
+`web/` — the same dashboard `scripts/run-dummy.sh --live --web` and
+`scripts/run-pi.sh --web` run through `ng serve` — can also run as a small
+nginx container instead of a dev server (see `web/Dockerfile` and
+`web/nginx.conf`, which reverse-proxies `/edh/v1/*` to `pq-meter-server`'s
+web API on the host the same way `ng serve`'s dev proxy does). It's an
+opt-in `docker-compose.yml` service, alongside Grafana rather than replacing
+it, and — like Grafana — needs `pq-meter-server` already running on the host
+(see the "Dashboards with Grafana" section above):
+
+```bash
+docker compose --profile dashboard up -d
+open http://localhost:8080
+```
+
+Unlike `ng serve`, this is a snapshot of `web/`'s source at image-build time
+— rebuild the image after changing it:
+
+```bash
+docker compose build dashboard
+docker compose --profile dashboard up -d
+```
+
+## Sharing a dashboard with ngrok
+
+Either dashboard above — Grafana or the Angular one — can be exposed at a
+public ngrok URL instead of just `localhost`, via a `docker-compose.yml`
+profile. Handy for showing a live demo to someone not on your network.
+
+1. Get a free ngrok account and an auth token from
+   [the ngrok dashboard](https://dashboard.ngrok.com/get-started/your-authtoken).
+2. Put it in a git-ignored `.env` file next to `docker-compose.yml`:
+   ```
+   NGROK_AUTHTOKEN=<your token>
+   ```
+3. Start the share profile for whichever dashboard you want public — both
+   can run at once, side by side:
+   ```bash
+   docker compose --profile share up -d              # Grafana, publicly
+   docker compose --profile share-dashboard up -d    # the Angular dashboard, publicly
+   ```
+4. Find the public URL, either from the container's own logs or its local
+   inspection UI:
+   ```bash
+   docker compose logs ngrok             # Grafana's tunnel
+   docker compose logs ngrok-dashboard   # the Angular dashboard's tunnel
+   ```
+   `http://localhost:4040` (Grafana's tunnel) / `http://localhost:4041` (the
+   Angular dashboard's tunnel).
+
+Without anything else set, that URL is randomly assigned on every restart.
+For a stable one, claim a free static domain (*Domains* section of the
+ngrok dashboard, looks like `your-name.ngrok-free.app`) and add it to the
+same `.env` file:
+
+```
+NGROK_DOMAIN=your-name.ngrok-free.app             # for --profile share (Grafana)
+NGROK_DASHBOARD_DOMAIN=your-other.ngrok-free.app  # for --profile share-dashboard
+```
+
+(ngrok's free tier gives one static domain per account, so only one of the
+two dashboards can have a stable URL unless you pay for more.)
+
+```bash
+docker compose --profile share --profile share-dashboard down   # stop everything above
+```
+
 ## Run it between the Pi and the laptop
 
 `scripts/run-pi.sh` automates everything below in one command: it starts the server, cross
 compiles the client, copies it to the Pi over `scp`, and starts it there (`--dummy-meter`
 instead of the real meter with `scripts/run-pi.sh --dummy-meter`). Add `--web` to also start
 the Angular dashboard (`web/`) at http://localhost:4200, reading live data through its dev
-proxy — same as `scripts/run-dummy.sh --live --web`, just against the real meter's data. It
-asks for the Pi's ssh password once and reuses that connection for the rest. See the script's
+proxy — same as `scripts/run-dummy.sh --live --web`, just against the real meter's data. Add
+`--skip-build` to skip rebuilding (and re-cross-compiling and re-`scp`ing) the binaries and
+just restart against whatever the last run already built and copied to the Pi — handy for
+restarting after a network blip or to try a different flag combo without waiting on the cross
+compile again. It asks for the Pi's ssh password once and reuses that connection for the rest. See the script's
 own header comment for the environment variables it reads (Pi address, meter address,
 credentials) if your setup differs from the defaults in `CLAUDE.md`.
 

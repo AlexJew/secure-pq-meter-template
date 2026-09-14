@@ -10,6 +10,9 @@
 #                                        (`web/`) at http://localhost:4200, reading
 #                                        live data through its dev proxy. Installs
 #                                        `web/node_modules` first if missing.
+#   scripts/run-dummy.sh --live --skip-build   reuse the binaries from the last
+#                                        build instead of rebuilding every time --
+#                                        only when neither crate's source changed.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -17,18 +20,25 @@ cd "$repo_root"
 
 live=0
 web=0
+skip_build=0
 for arg in "$@"; do
   case "$arg" in
   --live) live=1 ;;
   --web) web=1 ;;
+  --skip-build) skip_build=1 ;;
   *)
-    echo "usage: $0 [--live] [--web]" >&2
+    echo "usage: $0 [--live] [--web] [--skip-build]" >&2
     exit 2
     ;;
   esac
 done
 if [ "$web" -eq 1 ] && [ "$live" -eq 0 ]; then
   echo "--web needs --live too: the dashboard has nothing to show without a running server" >&2
+  exit 2
+fi
+if [ "$skip_build" -eq 1 ] && [ "$live" -eq 0 ]; then
+  echo "--skip-build needs --live too: the hermetic mode's whole point is building and" >&2
+  echo "running the tests" >&2
   exit 2
 fi
 
@@ -44,8 +54,21 @@ if [ "$live" -eq 0 ]; then
   exit 0
 fi
 
-echo "==> building pq-meter-server and pq-meter-client"
-cargo build -p pq-meter-server -p pq-meter-client
+server_bin=./target/debug/pq-meter-server
+client_bin=./target/debug/pq-meter-client
+
+if [ "$skip_build" -eq 1 ]; then
+  echo "==> --skip-build: reusing the existing binaries instead of rebuilding"
+  for bin in "$server_bin" "$client_bin"; do
+    if [ ! -f "$bin" ]; then
+      echo "$bin does not exist -- run once without --skip-build first" >&2
+      exit 1
+    fi
+  done
+else
+  echo "==> building pq-meter-server and pq-meter-client"
+  cargo build -p pq-meter-server -p pq-meter-client
+fi
 
 # Both the client's and the server's SQLite files are transient/inspectable
 # local state, not something a fresh demo run should replay. Left over from
@@ -82,7 +105,7 @@ trap cleanup EXIT INT TERM
 # server as its own child, so `$!` below would be cargo's PID, and killing
 # it on cleanup would orphan the server holding the fixed endhost API port.
 echo "==> starting pq-meter-server (log: $log)"
-./target/debug/pq-meter-server >"$log" 2>&1 &
+"$server_bin" >"$log" 2>&1 &
 server_pid=$!
 
 # The SNAP assigns the server's SCION port on every start, so it has to be
@@ -170,7 +193,7 @@ fi
 # not while blocked on a synchronous foreground child, so a plain foreground
 # run would leave Ctrl-C unable to fire `cleanup` until the client itself
 # exited -- which, being a reconnect-forever daemon, it never does.
-./target/debug/pq-meter-client \
+"$client_bin" \
   --endhost-api "$endhost_api" \
   --server "$server_addr" \
   --dummy-meter &

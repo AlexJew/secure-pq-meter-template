@@ -9,6 +9,12 @@
 #   scripts/run-pi.sh --dummy-meter --web    # (`web/`) at http://localhost:4200, reading
 #                                             # live data through its dev proxy. Installs
 #                                             # `web/node_modules` first if missing.
+#   scripts/run-pi.sh --skip-build           # reuse the binaries (and, on the Pi, the
+#                                             # copy) from the last run instead of
+#                                             # rebuilding/re-cross-compiling/re-scp'ing
+#                                             # every time -- only the neither-changed
+#                                             # case, i.e. restarting after a network
+#                                             # blip or to pick a different flag combo.
 #
 # Override any of these via the environment if your setup differs from
 # CLAUDE.md's:
@@ -29,18 +35,20 @@ cd "$repo_root"
 
 dummy_meter=0
 web=0
+skip_build=0
 for arg in "$@"; do
   case "$arg" in
   --dummy-meter) dummy_meter=1 ;;
   --web) web=1 ;;
+  --skip-build) skip_build=1 ;;
   *)
-    echo "usage: $0 [--dummy-meter] [--web]" >&2
+    echo "usage: $0 [--dummy-meter] [--web] [--skip-build]" >&2
     exit 2
     ;;
   esac
 done
 
-PI_HOST=${PI_HOST:-10.175.8.132}
+PI_HOST=${PI_HOST:-10.175.23.38}
 PI_USER=${PI_USER:-anapaya}
 METER_IP=${METER_IP:-10.10.0.2}
 INTERVAL=${INTERVAL:-}
@@ -61,11 +69,24 @@ if [ -z "$BIND_IP" ]; then
   exit 2
 fi
 
-echo "==> building pq-meter-server"
-cargo build -p pq-meter-server
+server_bin=./target/debug/pq-meter-server
+client_bin=target/aarch64-unknown-linux-gnu/release/pq-meter-client
 
-echo "==> cross compiling pq-meter-client for the Pi (aarch64)"
-cargo cross build --release -p pq-meter-client --target aarch64-unknown-linux-gnu
+if [ "$skip_build" -eq 1 ]; then
+  echo "==> --skip-build: reusing the existing binaries instead of rebuilding"
+  for bin in "$server_bin" "$client_bin"; do
+    if [ ! -f "$bin" ]; then
+      echo "$bin does not exist -- run once without --skip-build first" >&2
+      exit 1
+    fi
+  done
+else
+  echo "==> building pq-meter-server"
+  cargo build -p pq-meter-server
+
+  echo "==> cross compiling pq-meter-client for the Pi (aarch64)"
+  cargo cross build --release -p pq-meter-client --target aarch64-unknown-linux-gnu
+fi
 
 # Unlike run-dummy.sh, this keeps data/pqmeter.db (and the per-gateway cursor
 # in it) across runs: the Pi's own pqmeter.db is never wiped either, since
@@ -100,7 +121,7 @@ trap cleanup EXIT INT TERM
 # Run the built binary directly, not `cargo run`: see scripts/run-dummy.sh's
 # comment on why that matters for cleanup.
 echo "==> starting pq-meter-server on $BIND_IP (log: $log)"
-./target/debug/pq-meter-server --bind-ip "$BIND_IP" >"$log" 2>&1 &
+"$server_bin" --bind-ip "$BIND_IP" >"$log" 2>&1 &
 server_pid=$!
 
 # The SNAP assigns the server's SCION port on every start, so it has to be
@@ -154,10 +175,12 @@ echo "==> opening an ssh connection to $PI_USER@$PI_HOST (password prompt below 
 ssh -o ControlMaster=auto -o ControlPath="$control_path" -o ControlPersist=10m \
   -fN "$PI_USER@$PI_HOST"
 
-echo "==> copying the client binary to the Pi"
-scp -o ControlPath="$control_path" \
-  target/aarch64-unknown-linux-gnu/release/pq-meter-client \
-  "$PI_USER@$PI_HOST:pq-meter-client"
+if [ "$skip_build" -eq 1 ]; then
+  echo "==> --skip-build: not re-copying the client binary, reusing what's already on the Pi"
+else
+  echo "==> copying the client binary to the Pi"
+  scp -o ControlPath="$control_path" "$client_bin" "$PI_USER@$PI_HOST:pq-meter-client"
+fi
 
 # Overwriting the binary file does not stop an already-running copy of it
 # (Linux keeps a running executable's old inode open) -- if a client was
